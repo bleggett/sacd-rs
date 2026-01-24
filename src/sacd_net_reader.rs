@@ -5,11 +5,11 @@ use std::net::{IpAddr, SocketAddr, TcpStream};
 use crate::{sacd_ripper::{ServerResponse, ServerRequest}, sacd_ripper::server_request::Type as req_type, sacd_ripper::server_response::Type as resp_type};
 use log::{debug, info};
 
-pub struct SacdNetReaderHandle {
+pub struct SacdNetReader {
     stream: TcpStream,
 }
 
-pub fn open_network_image(ip_addr: IpAddr, port: u16) -> Result<SacdNetReaderHandle> {
+pub fn open_network_reader(ip_addr: IpAddr, port: u16) -> Result<SacdNetReader> {
     let socket_addr = SocketAddr::new(ip_addr, port);
     let mut stream = TcpStream::connect(socket_addr)?;
 
@@ -70,7 +70,7 @@ pub fn open_network_image(ip_addr: IpAddr, port: u16) -> Result<SacdNetReaderHan
         anyhow::bail!("response result non-zero or incorrect type");
     }
 
-    let handle = SacdNetReaderHandle{
+    let handle = SacdNetReader{
         stream,
     };
 
@@ -85,6 +85,6 @@ mod tests {
 
     #[test]
     fn it_works() {
-        let handle = open_network_image(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 130)), 2002).expect("should init");
+        let handle = open_network_reader(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 130)), 2002).expect("should init");
     }
 }

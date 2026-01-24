@@ -1,5 +1,6 @@
 syntax = "proto3";
-package sacd_ripper;
+package libsacd.sacd_ripper;
+// Stolen from https://github.com/EuFlo/sacd-ripper/blob/c9af7d40a2a186aee1763ddc4c73f60c32270f8c/libs/libsacd/sacd_ripper.proto
 
 message ServerRequest
 {
