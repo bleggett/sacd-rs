@@ -1,0 +1,35 @@
+syntax = "proto3";
+package sacd_ripper;
+
+message ServerRequest
+{
+  enum Type
+  {
+    UNSPECIFIED_CMD = 0;
+    DISC_OPEN = 1;
+    DISC_CLOSE = 2;
+    DISC_READ = 3;
+    DISC_SIZE = 4;
+  }
+  Type type = 1;
+  optional uint32 sector_offset = 2;
+  optional uint32 sector_count = 3;
+}
+
+message ServerResponse
+{
+  enum Type
+  {
+    UNSPECIFIED_CMD = 0;
+    DISC_OPENED = 1;
+    DISC_CLOSED = 2;
+    DISC_READ = 3;
+    DISC_SIZE = 4;
+  }
+  Type type = 1;
+  int64 result = 2;
+  // Note that serverside will limit this to 1MB/1024KB,
+  // via a nanopb max size constraint,
+  // so clients should anticipate that.
+  optional bytes data = 3;
+}

@@ -1,0 +1,12 @@
+[package]
+name = "sacd-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+log = "0.4.29"
+prost = "0.14.3"
+
+[build-dependencies]
+prost-build = "0.14.3"
