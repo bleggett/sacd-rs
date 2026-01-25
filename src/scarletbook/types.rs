@@ -102,6 +102,104 @@ impl Version {
     }
 }
 
+/// Track text type identifiers
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TrackTextType {
+    Title = 0x01,
+    Performer = 0x02,
+    Songwriter = 0x03,
+    Composer = 0x04,
+    Arranger = 0x05,
+    Message = 0x06,
+    ExtraMessage = 0x07,
+    Copyright = 0x08,
+    TitlePhonetic = 0x81,
+    PerformerPhonetic = 0x82,
+    SongwriterPhonetic = 0x83,
+    ComposerPhonetic = 0x84,
+    ArrangerPhonetic = 0x85,
+    MessagePhonetic = 0x86,
+    ExtraMessagePhonetic = 0x87,
+    CopyrightPhonetic = 0x88,
+    Unknown(u8),
+}
+
+impl From<u8> for TrackTextType {
+    fn from(val: u8) -> Self {
+        match val {
+            0x01 => TrackTextType::Title,
+            0x02 => TrackTextType::Performer,
+            0x03 => TrackTextType::Songwriter,
+            0x04 => TrackTextType::Composer,
+            0x05 => TrackTextType::Arranger,
+            0x06 => TrackTextType::Message,
+            0x07 => TrackTextType::ExtraMessage,
+            0x08 => TrackTextType::Copyright,
+            0x81 => TrackTextType::TitlePhonetic,
+            0x82 => TrackTextType::PerformerPhonetic,
+            0x83 => TrackTextType::SongwriterPhonetic,
+            0x84 => TrackTextType::ComposerPhonetic,
+            0x85 => TrackTextType::ArrangerPhonetic,
+            0x86 => TrackTextType::MessagePhonetic,
+            0x87 => TrackTextType::ExtraMessagePhonetic,
+            0x88 => TrackTextType::CopyrightPhonetic,
+            n => TrackTextType::Unknown(n),
+        }
+    }
+}
+
+/// Track metadata text
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrackText {
+    pub title: Option<String>,
+    pub performer: Option<String>,
+    pub songwriter: Option<String>,
+    pub composer: Option<String>,
+    pub arranger: Option<String>,
+    pub message: Option<String>,
+    pub extra_message: Option<String>,
+    pub copyright: Option<String>,
+    pub title_phonetic: Option<String>,
+    pub performer_phonetic: Option<String>,
+    pub songwriter_phonetic: Option<String>,
+    pub composer_phonetic: Option<String>,
+    pub arranger_phonetic: Option<String>,
+    pub message_phonetic: Option<String>,
+    pub extra_message_phonetic: Option<String>,
+    pub copyright_phonetic: Option<String>,
+}
+
+impl TrackText {
+    fn set_text(&mut self, text_type: TrackTextType, text: String) {
+        if text.is_empty() {
+            return;
+        }
+
+        let target = match text_type {
+            TrackTextType::Title => &mut self.title,
+            TrackTextType::Performer => &mut self.performer,
+            TrackTextType::Songwriter => &mut self.songwriter,
+            TrackTextType::Composer => &mut self.composer,
+            TrackTextType::Arranger => &mut self.arranger,
+            TrackTextType::Message => &mut self.message,
+            TrackTextType::ExtraMessage => &mut self.extra_message,
+            TrackTextType::Copyright => &mut self.copyright,
+            TrackTextType::TitlePhonetic => &mut self.title_phonetic,
+            TrackTextType::PerformerPhonetic => &mut self.performer_phonetic,
+            TrackTextType::SongwriterPhonetic => &mut self.songwriter_phonetic,
+            TrackTextType::ComposerPhonetic => &mut self.composer_phonetic,
+            TrackTextType::ArrangerPhonetic => &mut self.arranger_phonetic,
+            TrackTextType::MessagePhonetic => &mut self.message_phonetic,
+            TrackTextType::ExtraMessagePhonetic => &mut self.extra_message_phonetic,
+            TrackTextType::CopyrightPhonetic => &mut self.copyright_phonetic,
+            TrackTextType::Unknown(_) => return,
+        };
+
+        *target = Some(text);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MasterToc {
     // M_TOC_0_Header (16 bytes)
@@ -366,29 +464,53 @@ pub struct AreaToc {
     /// Area_Copyright_Phonetic_Ptr
     pub copyright_phonetic_offset: u16,
     /// Area_Text
-    pub data: Vec<u8>,
+    pub track_texts: Vec<TrackText>,
 }
 
 impl AreaToc {
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let mut cursor = Cursor::new(bytes);
-        Self::parse(&mut cursor)
-    }
 
     /// Parse an Area TOC structure from a reader
     ///
     /// # Arguments
     /// * `reader` - A reader positioned at the start of an Area TOC sector
     ///
+    /// # Note
+    /// This reads ALL sectors for the area (based on the `size` field) to parse track text.
+    pub fn parse<R: Read>(reader: &mut R) -> Result<Self> {
+        // Read first sector to get the size
+        let mut first_sector = [0u8; consts::SACD_LSN_SIZE];
+        reader.read_exact(&mut first_sector)?;
+
+        let size = u16::from_be_bytes([first_sector[10], first_sector[11]]);
+
+        // Read remaining sectors
+        let additional_bytes = ((size as usize).saturating_sub(1)) * consts::SACD_LSN_SIZE;
+        let mut complete_area_data = Vec::with_capacity(size as usize * consts::SACD_LSN_SIZE);
+        complete_area_data.extend_from_slice(&first_sector);
+
+        if additional_bytes > 0 {
+            let start_len = complete_area_data.len();
+            complete_area_data.resize(start_len + additional_bytes, 0);
+            reader.read_exact(&mut complete_area_data[start_len..])?;
+        }
+
+        Self::from_bytes(&complete_area_data)
+    }
+
+    /// Parse from complete area data buffer
+    ///
+    /// # Arguments
+    /// * `area_data` - Complete area TOC data (all sectors)
+    ///
     /// # Format
     /// SACD uses big-endian byte order for multi-byte integers.
     /// Single-byte bitfields are extracted using the on-disc bit positions (big-endian layout).
-    pub fn parse<R: Read>(reader: &mut R) -> Result<Self> {
+    pub fn from_bytes(area_data: &[u8]) -> Result<Self> {
+        let mut reader = Cursor::new(area_data);
         let mut id = [0u8; 8];
         reader.read_exact(&mut id)?;
 
-        let version = Version::parse(reader)?;
+        let version = Version::parse(&mut reader)?;
         let size = reader.read_u16::<BigEndian>()?;
 
         let mut reserved01 = [0u8; 4];
@@ -430,7 +552,7 @@ impl AreaToc {
         let mut reserved06 = [0u8; 15];
         reader.read_exact(&mut reserved06)?;
 
-        let total_playtime = PlayTime::parse(reader)?;
+        let total_playtime = PlayTime::parse(&mut reader)?;
 
         let _reserved07 = reader.read_u8()?;
         let track_offset = reader.read_u8()?;
@@ -449,7 +571,7 @@ impl AreaToc {
 
         let mut languages = Vec::with_capacity(consts::MAX_LANGUAGE_COUNT);
         for _ in 0..consts::MAX_LANGUAGE_COUNT {
-            languages.push(LocaleTable::parse(reader)?);
+            languages.push(LocaleTable::parse(&mut reader)?);
         }
 
         let mut reserved091 = [0u8; 8];
@@ -469,6 +591,14 @@ impl AreaToc {
 
         let mut data = vec![0u8; 1896];
         reader.read_exact(&mut data)?;
+
+        // Parse track text from complete area data
+        let track_texts = Self::parse_track_text(
+            area_data,
+            track_text_offset,
+            track_count,
+            &languages,
+        )?;
 
         Ok(AreaToc {
             id,
@@ -497,7 +627,7 @@ impl AreaToc {
             copyright_offset,
             area_description_phonetic_offset,
             copyright_phonetic_offset,
-            data,
+            track_texts,
         })
     }
 
@@ -508,11 +638,148 @@ impl AreaToc {
 
     /// Check if this is a 2-channel area
     pub fn is_two_channel(&self) -> bool {
-        &self.id == consts::AREA_TOC_SIGNATURE_STEREO
+        &self.id == consts::AREA_TOC_SIGNATURE_STEREO &&
+            self.channel_count == 2 &&
+            self.loudspeaker_config == 0
     }
 
     /// Check if this is a multi-channel area
     pub fn is_multi_channel(&self) -> bool {
         &self.id == consts::AREA_TOC_SIGNATURE_MCH
     }
+
+    /// Parse track text from the raw area data
+    ///
+    /// This parses the "SACDTTxt" section which contains metadata for each track.
+    ///
+    /// # Arguments
+    /// * `area_data` - Complete area data (multiple sectors, starting from Area TOC)
+    /// * `track_text_offset` - Offset in sectors to the track text
+    /// * `track_count` - Number of tracks
+    /// * `languages` - Language/charset information
+    ///
+    /// # Returns
+    /// Vector of TrackText, one for each track in the area
+    fn parse_track_text(
+        area_data: &[u8],
+        track_text_offset: u16,
+        track_count: u8,
+        languages: &[LocaleTable],
+    ) -> Result<Vec<TrackText>> {
+        if track_text_offset == 0 {
+            // No track text present
+            return Ok(vec![TrackText::default(); track_count as usize]);
+        }
+
+        // Track text starts at track_text_offset sectors from the beginning
+        let track_text_start = (track_text_offset as usize) * consts::SACD_LSN_SIZE;
+
+        if track_text_start + 8 > area_data.len() {
+            anyhow::bail!("Track text offset beyond area data bounds");
+        }
+
+        // Verify signature
+        let signature = &area_data[track_text_start..track_text_start + 8];
+        if signature != b"SACDTTxt" {
+            anyhow::bail!("Invalid track text signature: expected 'SACDTTxt'");
+        }
+
+        let mut track_texts = vec![TrackText::default(); track_count as usize];
+
+        // Get character set from first locale
+        let _character_set = if !languages.is_empty() {
+            languages[0].character_set
+        } else {
+            2 // Default to ISO-8859-1
+        };
+
+        // Parse track text positions
+        let positions_start = track_text_start + 8;
+
+        for track_idx in 0..track_count as usize {
+            let pos_offset = positions_start + (track_idx * 2);
+
+            if pos_offset + 2 > area_data.len() {
+                continue;
+            }
+
+            // Read the track text position (big-endian u16)
+            let track_text_pos = u16::from_be_bytes([
+                area_data[pos_offset],
+                area_data[pos_offset + 1],
+            ]) as usize;
+
+            if track_text_pos == 0 {
+                continue; // No text for this track
+            }
+
+            let text_start = track_text_start + track_text_pos;
+
+            if text_start >= area_data.len() {
+                continue;
+            }
+
+            // Read N_Items (number of text items for this track)
+            let n_items = area_data[text_start] as usize;
+
+            // Skip 4 bytes total (N_Items + 3 reserved bytes)
+            let mut ptr = text_start + 4;
+
+            for _ in 0..n_items {
+                if ptr >= area_data.len() {
+                    break;
+                }
+
+                // Read Text_Type (1 byte)
+                let text_type = TrackTextType::from(area_data[ptr]);
+                ptr += 1;
+
+                // Read Padding1 (1 byte, should be 0x20)
+                if ptr >= area_data.len() {
+                    break;
+                }
+                let padding1 = area_data[ptr];
+                ptr += 1;
+
+                if padding1 != 0x20 {
+                    eprintln!("Warning: Padding1 is not 0x20 (got 0x{:02x})", padding1);
+                }
+
+                // Read null-terminated string
+                if ptr >= area_data.len() {
+                    break;
+                }
+
+                let string_start = ptr;
+                while ptr < area_data.len() && area_data[ptr] != 0 {
+                    ptr += 1;
+                }
+
+                if ptr >= area_data.len() {
+                    break;
+                }
+
+                let string_bytes = &area_data[string_start..ptr];
+
+                // Convert to String, replacing invalid UTF-8 sequences
+                // Note: This assumes the text is ASCII-compatible
+                // For proper character set conversion, you'd need a charset conversion library
+                let text = String::from_utf8_lossy(string_bytes).to_string();
+
+                // Store in the appropriate field
+                track_texts[track_idx].set_text(text_type, text);
+
+                // Skip null terminator
+                ptr += 1;
+
+                // Skip Padding2 (0-3 bytes of 0x00)
+                while ptr < area_data.len() && area_data[ptr] == 0 {
+                    ptr += 1;
+                }
+            }
+        }
+
+        Ok(track_texts)
+    }
 }
+
