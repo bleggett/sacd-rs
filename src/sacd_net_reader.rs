@@ -3,7 +3,7 @@ use crate::{
     sacd_ripper::server_response::Type as resp_type,
     sacd_ripper::{ServerRequest, ServerResponse},
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use log::{debug, info};
 use prost::Message;
 use std::io::{Read, Write};
@@ -33,14 +33,19 @@ impl SacdNetReader {
 
     fn send_req(&mut self, req: ServerRequest) -> Result<ServerResponse> {
         let mut encoded_request = Vec::new();
-        req.encode(&mut encoded_request)?;
+        req.encode(&mut encoded_request)
+            .context("couldn't encode request")?;
 
-        self.stream.write_all(&encoded_request)?;
+        self.stream
+            .write_all(&encoded_request)
+            .context("couldn't write stream")?;
 
         // The original C implementation of the ripper protocol
         // terminates the protobuf payload with a zero.
         let zero: u8 = 0;
-        self.stream.write_all(&[zero])?;
+        self.stream
+            .write_all(&[zero])
+            .context("couldn't write stream terminator")?;
         self.stream.flush()?;
 
         // Read response from the socket.
@@ -52,7 +57,10 @@ impl SacdNetReader {
         let max_size = 1024 * 1024 + 1024; // 1MB data + overhead
 
         loop {
-            let bytes_read = self.stream.read(&mut temp_buf)?;
+            let bytes_read = self
+                .stream
+                .read(&mut temp_buf)
+                .context("couldn't read from stream")?;
             if bytes_read == 0 {
                 anyhow::bail!("Connection closed before receiving complete message");
             }
@@ -75,7 +83,7 @@ impl SacdNetReader {
                         );
                         return Ok(response);
                     }
-                    Err(err) => {
+                    Err(_) => {
                         // Decode failed - we need more data (the zero we found was in the middle of the data)
                         debug!("incomplete response, reading more");
                     }
@@ -131,7 +139,7 @@ impl SacdNetReader {
 
 pub fn open_network_reader(ip_addr: IpAddr, port: u16) -> Result<SacdNetReader> {
     let socket_addr = SocketAddr::new(ip_addr, port);
-    let stream = TcpStream::connect(socket_addr)?;
+    let stream = TcpStream::connect(socket_addr).context("couldn't connect to server")?;
 
     let mut handle = SacdNetReader { stream };
 

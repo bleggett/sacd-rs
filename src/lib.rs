@@ -37,14 +37,13 @@ mod tests {
     }
 
     #[test]
-    fn test_read_toc() {
+    fn test_read_master_toc() {
         init();
         let handle =
             sacd_net_reader::open_network_reader(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 130)), 2002)
                 .expect("should init");
-        let mut sbreader = scarletbook::reader::new(handle).expect("should create sbreader");
-        let res = sbreader.read_master_toc().expect("should read toc");
-        println!("{:?}", res);
-        println!("DISC CATALOG: {}", res.disc_catalog())
+        let sbreader = scarletbook::reader::new(handle).expect("should create sbreader");
+        let master_toc = sbreader.get_master_toc();
+        println!("DISC CATALOG: {}", master_toc.disc_catalog())
     }
 }
