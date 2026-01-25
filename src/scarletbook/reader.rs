@@ -6,11 +6,12 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::scarletbook::consts;
-use crate::scarletbook::types::{AreaToc, MasterToc};
+use crate::scarletbook::types::{AreaToc, MasterToc, MasterText};
 
 pub struct ScarletBookReader {
     reader: SacdNetReader,
     master_toc: MasterToc,
+    master_text: Option<MasterText>,
     stereo_toc: Option<AreaToc>,
     stereo_area_index: i32,
     mch_area_index: i32,
@@ -20,11 +21,14 @@ pub struct ScarletBookReader {
 pub fn new(mut reader: SacdNetReader) -> Result<ScarletBookReader> {
     let master_toc = read_master_toc(&mut reader)?;
 
+    let master_text = read_master_text(&mut reader);
+
     let stereo_toc = read_stereo_toc(&master_toc, &mut reader);
 
     let sbreader = ScarletBookReader {
         reader,
         master_toc,
+        master_text,
         stereo_toc,
         stereo_area_index: -1,
         mch_area_index: -1,
@@ -90,7 +94,21 @@ impl ScarletBookReader {
             }
         }
 
-        // TODO: Print disc title, artist, publisher, copyright from master text
+        // Print disc text from master text
+        if let Some(ref mt) = self.master_text {
+            if let Some(ref title) = mt.disc_title {
+                println!("    Title: {}", title);
+            }
+            if let Some(ref artist) = mt.disc_artist {
+                println!("    Artist: {}", artist);
+            }
+            if let Some(ref publisher) = mt.disc_publisher {
+                println!("    Publisher: {}", publisher);
+            }
+            if let Some(ref copyright) = mt.disc_copyright {
+                println!("    Copyright: {}", copyright);
+            }
+        }
     }
 
     fn print_album_info_section(&self) {
@@ -109,7 +127,21 @@ impl ScarletBookReader {
         println!("    Sequence Number: {}", mtoc.album_sequence_number);
         println!("    Set Size: {}", mtoc.album_set_size);
 
-        // TODO: Print album title, artist, publisher, copyright from master text
+        // Print album text from master text
+        if let Some(ref mt) = self.master_text {
+            if let Some(ref title) = mt.album_title {
+                println!("    Title: {}", title);
+            }
+            if let Some(ref artist) = mt.album_artist {
+                println!("    Artist: {}", artist);
+            }
+            if let Some(ref publisher) = mt.album_publisher {
+                println!("    Publisher: {}", publisher);
+            }
+            if let Some(ref copyright) = mt.album_copyright {
+                println!("    Copyright: {}", copyright);
+            }
+        }
     }
 
     fn print_area_count(&self) {
@@ -173,6 +205,16 @@ fn read_master_toc(reader: &mut SacdNetReader) -> Result<MasterToc> {
         .read_data(consts::START_OF_MASTER_TOC, consts::MASTER_TOC_LEN)
         .context("couldn't read master TOC bytes")?;
     Ok(MasterToc::from_bytes(&res).context("couldn't parse master TOC bytes")?)
+}
+
+fn read_master_text(reader: &mut SacdNetReader) -> Option<MasterText> {
+    // Master text is at sector 511 (START_OF_MASTER_TOC + 1)
+    // Read 1 sector (2048 bytes)
+    let master_text_sector = consts::START_OF_MASTER_TOC + 1;
+    reader
+        .read_data(master_text_sector, 1)
+        .and_then(|data| MasterText::from_bytes(&data))
+        .ok()
 }
 
 fn read_stereo_toc(master_toc: &MasterToc, reader: &mut SacdNetReader) -> Option<AreaToc> {

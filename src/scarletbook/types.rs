@@ -3,6 +3,84 @@ use anyhow::{Context, Result};
 use byteorder::{BigEndian, ReadBytesExt};
 use std::io::{self, Cursor, Read};
 
+#[derive(Debug, Clone, Default)]
+pub struct MasterText {
+    pub album_title: Option<String>,
+    pub album_artist: Option<String>,
+    pub album_publisher: Option<String>,
+    pub album_copyright: Option<String>,
+    pub disc_title: Option<String>,
+    pub disc_artist: Option<String>,
+    pub disc_publisher: Option<String>,
+    pub disc_copyright: Option<String>,
+}
+
+impl MasterText {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < 2048 {
+            anyhow::bail!("Master text data too short");
+        }
+
+        let mut cursor = Cursor::new(bytes);
+
+        // Read and verify ID
+        let mut id = [0u8; 8];
+        cursor.read_exact(&mut id)?;
+        if &id != b"SACDText" {
+            anyhow::bail!("Invalid master text signature");
+        }
+
+        // Skip reserved
+        cursor.set_position(16);
+
+        // Read all the position pointers
+        let album_title_pos = cursor.read_u16::<BigEndian>()?;
+        let album_artist_pos = cursor.read_u16::<BigEndian>()?;
+        let album_publisher_pos = cursor.read_u16::<BigEndian>()?;
+        let album_copyright_pos = cursor.read_u16::<BigEndian>()?;
+        let _album_title_phonetic_pos = cursor.read_u16::<BigEndian>()?;
+        let _album_artist_phonetic_pos = cursor.read_u16::<BigEndian>()?;
+        let _album_publisher_phonetic_pos = cursor.read_u16::<BigEndian>()?;
+        let _album_copyright_phonetic_pos = cursor.read_u16::<BigEndian>()?;
+        let disc_title_pos = cursor.read_u16::<BigEndian>()?;
+        let disc_artist_pos = cursor.read_u16::<BigEndian>()?;
+        let disc_publisher_pos = cursor.read_u16::<BigEndian>()?;
+        let disc_copyright_pos = cursor.read_u16::<BigEndian>()?;
+
+        // Helper function to extract null-terminated string from position
+        let extract_string = |pos: u16| -> Option<String> {
+            if pos == 0 || pos as usize >= bytes.len() {
+                return None;
+            }
+            let start = pos as usize;
+            let end = bytes[start..]
+                .iter()
+                .position(|&b| b == 0)
+                .map(|i| start + i)
+                .unwrap_or(bytes.len());
+            let s = String::from_utf8_lossy(&bytes[start..end])
+                .trim()
+                .to_string();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        };
+
+        Ok(MasterText {
+            album_title: extract_string(album_title_pos),
+            album_artist: extract_string(album_artist_pos),
+            album_publisher: extract_string(album_publisher_pos),
+            album_copyright: extract_string(album_copyright_pos),
+            disc_title: extract_string(disc_title_pos),
+            disc_artist: extract_string(disc_artist_pos),
+            disc_publisher: extract_string(disc_publisher_pos),
+            disc_copyright: extract_string(disc_copyright_pos),
+        })
+    }
+}
+
 /// Frame format types for SACD audio
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
