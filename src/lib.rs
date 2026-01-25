@@ -2,6 +2,7 @@ use std::net::{IpAddr, SocketAddr, TcpStream};
 
 mod sacd_net_reader;
 mod scarletbook;
+use std::path::Path;
 
 pub mod sacd_ripper {
     include!(concat!(env!("OUT_DIR"), "/libsacd.sacd_ripper.rs"));
@@ -45,5 +46,25 @@ mod tests {
         let sbreader = scarletbook::reader::new(handle).expect("should create sbreader");
         let master_toc = sbreader.get_master_toc();
         println!("DISC CATALOG: {}", master_toc.disc_catalog())
+    }
+
+    #[test]
+    fn test_read_stereo_area_toc() {
+        init();
+        let handle =
+            sacd_net_reader::open_network_reader(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 130)), 2002)
+                .expect("should init");
+        let sbreader = scarletbook::reader::new(handle).expect("should create sbreader");
+        let stereo_toc = sbreader.get_stereo_toc().expect("stereo toc not present");
+        println!("stereo toc: {:#?}", stereo_toc)
+    }
+
+    #[test]
+    fn test_dump_iso() {
+        init();
+        let mut handle =
+            sacd_net_reader::open_network_reader(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 130)), 2002)
+                .expect("should init");
+        handle.dump_iso(Path::new("/var/home/bleggett/TEST.iso"), None::<fn(u32, u32)>).expect("write success");
     }
 }

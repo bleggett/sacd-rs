@@ -1,6 +1,9 @@
 use crate::sacd_net_reader::SacdNetReader;
 use anyhow::{Context, Result};
 use log::{debug, info, warn};
+use std::fs::File;
+use std::io::Write;
+use std::path::Path;
 
 use crate::scarletbook::consts;
 use crate::scarletbook::types::{AreaToc, MasterToc};
@@ -16,6 +19,38 @@ pub struct ScarletBookReader {
 pub fn new(mut reader: SacdNetReader) -> Result<ScarletBookReader> {
     let master_toc = read_master_toc(&mut reader)?;
 
+    let stereo_toc = read_stereo_toc(&master_toc, &mut reader);
+
+    let sbreader = ScarletBookReader {
+        reader,
+        master_toc,
+        stereo_toc,
+        stereo_area_index: -1,
+        mch_area_index: -1,
+    };
+
+    Ok(sbreader)
+}
+
+impl ScarletBookReader {
+    pub fn get_master_toc(&self) -> MasterToc {
+        self.master_toc.clone()
+    }
+
+    pub fn get_stereo_toc(&self) -> Option<AreaToc> {
+        self.stereo_toc.clone()
+    }
+
+}
+
+fn read_master_toc(reader: &mut SacdNetReader) -> Result<MasterToc> {
+    let res = reader
+        .read_data(consts::START_OF_MASTER_TOC, consts::MASTER_TOC_LEN)
+        .context("couldn't read master TOC bytes")?;
+    Ok(MasterToc::from_bytes(&res).context("couldn't parse master TOC bytes")?)
+}
+
+fn read_stereo_toc(master_toc: &MasterToc, reader: &mut SacdNetReader) -> Option<AreaToc> {
     // Look for stereo TOC 1
     let stereo_toc1 = if master_toc.area_1_toc_1_start > 0 {
         reader
@@ -44,7 +79,7 @@ pub fn new(mut reader: SacdNetReader) -> Result<ScarletBookReader> {
         None
     };
 
-    let stereo_toc = match (stereo_toc1, stereo_toc2) {
+    match (stereo_toc1, stereo_toc2) {
         (Some(toc1), Some(toc2)) => {
             if toc1 == toc2 {
                 // Both exist and are equal - use TOC 1
@@ -67,32 +102,9 @@ pub fn new(mut reader: SacdNetReader) -> Result<ScarletBookReader> {
             warn!("No stereo TOC found");
             None
         },
-    };
-
-
-    let sbreader = ScarletBookReader {
-        reader,
-        master_toc,
-        stereo_toc,
-        stereo_area_index: -1,
-        mch_area_index: -1,
-    };
-
-    Ok(sbreader)
-}
-
-impl ScarletBookReader {
-    pub fn get_master_toc(&self) -> MasterToc {
-        self.master_toc.clone()
     }
 }
 
-fn read_master_toc(reader: &mut SacdNetReader) -> Result<MasterToc> {
-    let res = reader
-        .read_data(consts::START_OF_MASTER_TOC, consts::MASTER_TOC_LEN)
-        .context("couldn't read master TOC bytes")?;
-    Ok(MasterToc::from_bytes(&res).context("couldn't parse master TOC bytes")?)
-}
 
 #[cfg(test)]
 mod tests {

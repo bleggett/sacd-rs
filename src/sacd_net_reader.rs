@@ -8,6 +8,8 @@ use log::{debug, info};
 use prost::Message;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::fs::File;
+use std::path::Path;
 
 pub struct SacdNetReader {
     stream: TcpStream,
@@ -100,6 +102,27 @@ impl SacdNetReader {
         }
     }
 
+    /// Get the total number of sectors on the disc
+    ///
+    /// # Returns
+    /// * `Ok(u32)` - Total number of sectors
+    /// * `Err` - If the request fails
+    pub fn get_total_sectors(&mut self) -> Result<u32> {
+        let req = ServerRequest {
+            r#type: req_type::DiscSize as i32,
+            sector_offset: Some(0),
+            sector_count: Some(0),
+        };
+
+        let response = self.send_req(req)?;
+
+        if response.r#type != resp_type::DiscSize as i32 {
+            anyhow::bail!("Expected DISC_SIZE response, got type {}", response.r#type);
+        }
+
+        Ok(response.result as u32)
+    }
+
     /// Read sectors from the disc.
     ///
     /// # Arguments
@@ -134,6 +157,80 @@ impl SacdNetReader {
                 response.result
             );
         }
+    }
+
+    /// Dump the entire SACD disc to an ISO file
+    ///
+    /// This reads all sectors from the disc and writes them to an ISO file.
+    /// Note: This function does not handle decryption - it writes raw sectors.
+    ///
+    /// # Arguments
+    /// * `output_path` - Path to the output ISO file
+    /// * `progress_callback` - Optional callback for progress updates (current_sector, total_sectors)
+    ///
+    /// # Returns
+    /// * `Ok(u32)` - Total number of sectors written
+    /// * `Err` - If the dump fails
+    pub fn dump_iso<P: AsRef<Path>, F>(
+        &mut self,
+        output_path: P,
+        mut progress_callback: Option<F>,
+    ) -> Result<u32>
+    where
+        F: FnMut(u32, u32),
+    {
+        const SACD_LSN_SIZE: usize = 2048;
+        const MAX_BLOCK_SIZE: u32 = 512; // Read 512 sectors at a time (1MB)
+
+        // Get total sectors
+        let total_sectors = self.get_total_sectors()
+            .context("Failed to get total sectors")?;
+
+        info!("Dumping ISO: {} sectors ({} MB)",
+            total_sectors,
+            (total_sectors as u64 * SACD_LSN_SIZE as u64) / (1024 * 1024)
+        );
+
+        // Create output file
+        let mut output_file = File::create(output_path.as_ref())
+            .context("Failed to create output file")?;
+
+        let mut current_sector = 0u32;
+
+        while current_sector < total_sectors {
+            let block_size = std::cmp::min(MAX_BLOCK_SIZE, total_sectors - current_sector);
+
+            // Read sectors
+            let data = self.read_data(current_sector, block_size)
+                .with_context(|| format!("Failed to read sectors {} to {}",
+                    current_sector, current_sector + block_size))?;
+
+            // Write to file
+            output_file.write_all(&data)
+                .context("Failed to write to output file")?;
+
+            current_sector += block_size;
+
+            // Call progress callback if provided
+            if let Some(ref mut callback) = progress_callback {
+                callback(current_sector, total_sectors);
+            }
+
+            if current_sector % 10240 == 0 || current_sector == total_sectors {
+                info!("Progress: {}/{} sectors ({:.1}%)",
+                    current_sector,
+                    total_sectors,
+                    (current_sector as f64 / total_sectors as f64) * 100.0
+                );
+            }
+        }
+
+        output_file.flush()
+            .context("Failed to flush output file")?;
+
+        info!("ISO dump complete: {} sectors written", total_sectors);
+
+        Ok(total_sectors)
     }
 }
 
