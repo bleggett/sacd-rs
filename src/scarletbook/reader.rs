@@ -40,7 +40,6 @@ impl ScarletBookReader {
     pub fn get_stereo_toc(&self) -> Option<AreaToc> {
         self.stereo_toc.clone()
     }
-
 }
 
 fn read_master_toc(reader: &mut SacdNetReader) -> Result<MasterToc> {
@@ -57,9 +56,9 @@ fn read_stereo_toc(master_toc: &MasterToc, reader: &mut SacdNetReader) -> Option
             .read_data(
                 master_toc.area_1_toc_1_start,
                 master_toc.area_1_toc_size as u32,
-            ).and_then(|tocdata| {
-                AreaToc::from_bytes(&tocdata)
-            }).ok()
+            )
+            .and_then(|tocdata| AreaToc::from_bytes(&tocdata))
+            .ok()
     } else {
         warn!("Couldn't read Stereo TOC 1");
         None
@@ -71,9 +70,9 @@ fn read_stereo_toc(master_toc: &MasterToc, reader: &mut SacdNetReader) -> Option
             .read_data(
                 master_toc.area_1_toc_2_start,
                 master_toc.area_1_toc_size as u32,
-            ).and_then(|tocdata| {
-                AreaToc::from_bytes(&tocdata)
-            }).ok()
+            )
+            .and_then(|tocdata| AreaToc::from_bytes(&tocdata))
+            .ok()
     } else {
         warn!("Couldn't read Stereo TOC 2");
         None
@@ -89,22 +88,21 @@ fn read_stereo_toc(master_toc: &MasterToc, reader: &mut SacdNetReader) -> Option
                 warn!("Stereo TOC 1 and TOC 2 differ, using backup TOC 2");
                 Some(toc2)
             }
-        },
+        }
         (Some(toc1), None) => {
             // Only TOC 1 exists
             Some(toc1)
-        },
+        }
         (None, Some(toc2)) => {
             // Only TOC 2 exists
             Some(toc2)
-        },
+        }
         (None, None) => {
             warn!("No stereo TOC found");
             None
-        },
+        }
     }
 }
-
 
 #[cfg(test)]
 mod tests {

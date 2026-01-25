@@ -468,7 +468,6 @@ pub struct AreaToc {
 }
 
 impl AreaToc {
-
     /// Parse an Area TOC structure from a reader
     ///
     /// # Arguments
@@ -593,12 +592,8 @@ impl AreaToc {
         reader.read_exact(&mut data)?;
 
         // Parse track text from complete area data
-        let track_texts = Self::parse_track_text(
-            area_data,
-            track_text_offset,
-            track_count,
-            &languages,
-        )?;
+        let track_texts =
+            Self::parse_track_text(area_data, track_text_offset, track_count, &languages)?;
 
         Ok(AreaToc {
             id,
@@ -638,9 +633,9 @@ impl AreaToc {
 
     /// Check if this is a 2-channel area
     pub fn is_two_channel(&self) -> bool {
-        &self.id == consts::AREA_TOC_SIGNATURE_STEREO &&
-            self.channel_count == 2 &&
-            self.loudspeaker_config == 0
+        &self.id == consts::AREA_TOC_SIGNATURE_STEREO
+            && self.channel_count == 2
+            && self.loudspeaker_config == 0
     }
 
     /// Check if this is a multi-channel area
@@ -704,10 +699,8 @@ impl AreaToc {
             }
 
             // Read the track text position (big-endian u16)
-            let track_text_pos = u16::from_be_bytes([
-                area_data[pos_offset],
-                area_data[pos_offset + 1],
-            ]) as usize;
+            let track_text_pos =
+                u16::from_be_bytes([area_data[pos_offset], area_data[pos_offset + 1]]) as usize;
 
             if track_text_pos == 0 {
                 continue; // No text for this track
@@ -782,4 +775,3 @@ impl AreaToc {
         Ok(track_texts)
     }
 }
-

@@ -4,11 +4,11 @@ use crate::{
     sacd_ripper::{ServerRequest, ServerResponse},
 };
 use anyhow::{Context, Result};
-use log::{debug, info};
+use log::{debug, info, trace};
 use prost::Message;
+use std::fs::File;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
-use std::fs::File;
 use std::path::Path;
 
 pub struct SacdNetReader {
@@ -75,11 +75,11 @@ impl SacdNetReader {
                 let msg_bytes = &buffer[..buffer.len() - 1];
                 match ServerResponse::decode(msg_bytes) {
                     Ok(response) => {
-                        debug!(
+                        trace!(
                             "Successfully decoded message ({} bytes + terminator)",
                             msg_bytes.len()
                         );
-                        debug!(
+                        trace!(
                             "Decoded response: type={}, result={}",
                             response.r#type, response.result
                         );
@@ -87,7 +87,7 @@ impl SacdNetReader {
                     }
                     Err(_) => {
                         // Decode failed - we need more data (the zero we found was in the middle of the data)
-                        debug!("incomplete response, reading more");
+                        trace!("incomplete response, reading more");
                     }
                 }
             }
@@ -120,7 +120,14 @@ impl SacdNetReader {
             anyhow::bail!("Expected DISC_SIZE response, got type {}", response.r#type);
         }
 
-        Ok(response.result as u32)
+        let total_sectors = response.result as u32;
+        info!(
+            "Server reported {} total sectors ({} MB)",
+            total_sectors,
+            (total_sectors as u64 * 2048) / (1024 * 1024)
+        );
+
+        Ok(total_sectors)
     }
 
     /// Read sectors from the disc.
@@ -149,7 +156,33 @@ impl SacdNetReader {
         // Note: response.result contains the number of sectors actually read
         if let Some(data) = response.data {
             let sectors_read = response.result as u32;
-            debug!("Read {} sectors ({} bytes)", sectors_read, data.len());
+
+            // Server may return fewer sectors than requested (e.g., at disc boundaries)
+            if sectors_read != block_count {
+                trace!(
+                    "Server returned {} sectors (requested {})",
+                    sectors_read, block_count
+                );
+            }
+
+            trace!(
+                "Read {} sectors ({} bytes) from sector {}",
+                sectors_read,
+                data.len(),
+                pos
+            );
+
+            // Verify data size matches sector count
+            let expected_size = (sectors_read as usize) * 2048;
+            if data.len() != expected_size {
+                anyhow::bail!(
+                    "Server returned {} bytes for {} sectors, expected {} bytes",
+                    data.len(),
+                    sectors_read,
+                    expected_size
+                );
+            }
+
             Ok(data)
         } else {
             anyhow::bail!(
@@ -174,26 +207,28 @@ impl SacdNetReader {
     pub fn dump_iso<P: AsRef<Path>, F>(
         &mut self,
         output_path: P,
+        lsn_size: usize,
         mut progress_callback: Option<F>,
     ) -> Result<u32>
     where
         F: FnMut(u32, u32),
     {
-        const SACD_LSN_SIZE: usize = 2048;
         const MAX_BLOCK_SIZE: u32 = 512; // Read 512 sectors at a time (1MB)
 
         // Get total sectors
-        let total_sectors = self.get_total_sectors()
+        let total_sectors = self
+            .get_total_sectors()
             .context("Failed to get total sectors")?;
 
-        info!("Dumping ISO: {} sectors ({} MB)",
+        info!(
+            "Dumping ISO: {} sectors ({} MB)",
             total_sectors,
-            (total_sectors as u64 * SACD_LSN_SIZE as u64) / (1024 * 1024)
+            (total_sectors as u64 * lsn_size as u64) / (1024 * 1024)
         );
 
         // Create output file
-        let mut output_file = File::create(output_path.as_ref())
-            .context("Failed to create output file")?;
+        let mut output_file =
+            File::create(output_path.as_ref()).context("Failed to create output file")?;
 
         let mut current_sector = 0u32;
 
@@ -201,15 +236,38 @@ impl SacdNetReader {
             let block_size = std::cmp::min(MAX_BLOCK_SIZE, total_sectors - current_sector);
 
             // Read sectors
-            let data = self.read_data(current_sector, block_size)
-                .with_context(|| format!("Failed to read sectors {} to {}",
-                    current_sector, current_sector + block_size))?;
+            let data = self
+                .read_data(current_sector, block_size)
+                .with_context(|| {
+                    format!(
+                        "Failed to read sectors {} to {}",
+                        current_sector,
+                        current_sector + block_size
+                    )
+                })?;
+
+            // Calculate actual sectors read (server may return less than requested)
+            let sectors_read = (data.len() / lsn_size) as u32;
+
+            if sectors_read == 0 {
+                // Server returned 0 sectors - this is an error if we haven't finished
+                if current_sector < total_sectors {
+                    anyhow::bail!(
+                        "Server returned 0 sectors at position {}, but {} sectors remain",
+                        current_sector,
+                        total_sectors - current_sector
+                    );
+                }
+                // We've reached the end
+                break;
+            }
 
             // Write to file
-            output_file.write_all(&data)
+            output_file
+                .write_all(&data)
                 .context("Failed to write to output file")?;
 
-            current_sector += block_size;
+            current_sector += sectors_read;
 
             // Call progress callback if provided
             if let Some(ref mut callback) = progress_callback {
@@ -217,7 +275,8 @@ impl SacdNetReader {
             }
 
             if current_sector % 10240 == 0 || current_sector == total_sectors {
-                info!("Progress: {}/{} sectors ({:.1}%)",
+                info!(
+                    "Finished: {}/{} sectors ({:.1}%)",
                     current_sector,
                     total_sectors,
                     (current_sector as f64 / total_sectors as f64) * 100.0
@@ -225,8 +284,7 @@ impl SacdNetReader {
             }
         }
 
-        output_file.flush()
-            .context("Failed to flush output file")?;
+        output_file.flush().context("Failed to flush output file")?;
 
         info!("ISO dump complete: {} sectors written", total_sectors);
 
