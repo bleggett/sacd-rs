@@ -3,7 +3,53 @@ use anyhow::{Context, Result};
 use byteorder::{BigEndian, ReadBytesExt};
 use std::io::{self, Cursor, Read};
 
-#[derive(Debug, Clone)]
+/// Frame format types for SACD audio
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FrameFormat {
+    /// DST coded. Flexible format
+    Dst = 0,
+    /// Reserved
+    Reserved = 1,
+    /// Fixed format. 2-Channel Stereo, Plain DSD, 3 Frames in 14 Sectors
+    Dsd3In14 = 2,
+    /// Fixed format. 2-Channel Stereo, Plain DSD, 3 Frames in 16 Sectors
+    Dsd3In16 = 3,
+    /// Reserved for future use (4..15)
+    Unknown(u8),
+}
+
+impl From<u8> for FrameFormat {
+    fn from(val: u8) -> Self {
+        match val {
+            0 => FrameFormat::Dst,
+            1 => FrameFormat::Reserved,
+            2 => FrameFormat::Dsd3In14,
+            3 => FrameFormat::Dsd3In16,
+            n => FrameFormat::Unknown(n),
+        }
+    }
+}
+
+/// Total_Area_Play_Time
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayTime {
+    pub minutes: u8, // 0-255
+    pub seconds: u8, // 0-59
+    pub frames: u8,  // 0-74
+}
+
+impl PlayTime {
+    fn parse<R: Read>(reader: &mut R) -> io::Result<Self> {
+        Ok(PlayTime {
+            minutes: reader.read_u8()?,
+            seconds: reader.read_u8()?,
+            frames: reader.read_u8()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GenreTable {
     pub category: u8,
     pub reserved: u8,
@@ -21,7 +67,7 @@ impl GenreTable {
 }
 
 /// Language and character set information
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LocaleTable {
     /// ISO-639-1 language code (e.g., "en")
     pub language_code: [u8; 2],
@@ -42,13 +88,13 @@ impl LocaleTable {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Version {
     pub major: u8,
     pub minor: u8,
 }
 impl Version {
-    fn read_from<R: Read>(reader: &mut R) -> Result<Self> {
+    fn parse<R: Read>(reader: &mut R) -> Result<Self> {
         Ok(Self {
             major: reader.read_u8()?,
             minor: reader.read_u8()?,
@@ -100,7 +146,7 @@ impl MasterToc {
         let mut id = [0u8; 8];
         reader.read_exact(&mut id)?;
 
-        let version = Version::read_from(reader)?;
+        let version = Version::parse(reader)?;
 
         let mut reserved01 = [0u8; 6];
         reader.read_exact(&mut reserved01)?;
@@ -252,66 +298,11 @@ impl MasterToc {
     }
 }
 
-/// Frame format types for SACD audio
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum FrameFormat {
-    /// DST coded. Flexible format
-    Dst = 0,
-    /// Reserved
-    Reserved = 1,
-    /// Fixed format. 2-Channel Stereo, Plain DSD, 3 Frames in 14 Sectors
-    Dsd3In14 = 2,
-    /// Fixed format. 2-Channel Stereo, Plain DSD, 3 Frames in 16 Sectors
-    Dsd3In16 = 3,
-    /// Reserved for future use (4..15)
-    Unknown(u8),
-}
-
-impl From<u8> for FrameFormat {
-    fn from(val: u8) -> Self {
-        match val {
-            0 => FrameFormat::Dst,
-            1 => FrameFormat::Reserved,
-            2 => FrameFormat::Dsd3In14,
-            3 => FrameFormat::Dsd3In16,
-            n => FrameFormat::Unknown(n),
-        }
-    }
-}
-
-/// Total_Area_Play_Time
-#[derive(Debug, Clone, Copy)]
-pub struct PlayTime {
-    pub minutes: u8, // 0-255
-    pub seconds: u8, // 0-59
-    pub frames: u8,  // 0-74
-}
-
-impl PlayTime {
-    fn parse<R: Read>(reader: &mut R) -> io::Result<Self> {
-        Ok(PlayTime {
-            minutes: reader.read_u8()?,
-            seconds: reader.read_u8()?,
-            frames: reader.read_u8()?,
-        })
-    }
-}
-
-impl Version {
-    fn parse<R: Read>(reader: &mut R) -> io::Result<Self> {
-        Ok(Version {
-            major: reader.read_u8()?,
-            minor: reader.read_u8()?,
-        })
-    }
-}
-
 /// SACD Area Table of Contents
 /// Scarlet Book: 'Area_TOC'
 /// This struct represents the complete Area TOC structure (2048 bytes)
 /// for either 2-channel or multi-channel audio areas on an SACD disc.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AreaToc {
     // ===== A_TOC_0_Header (16 bytes) =====
     /// Area_TOC_Signature: "TWOCHTOC" or "MULCHTOC"
@@ -379,6 +370,12 @@ pub struct AreaToc {
 }
 
 impl AreaToc {
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut cursor = Cursor::new(bytes);
+        Self::parse(&mut cursor)
+    }
+
     /// Parse an Area TOC structure from a reader
     ///
     /// # Arguments

@@ -3,13 +3,12 @@ use anyhow::{Context, Result};
 use log::{debug, info, warn};
 
 use crate::scarletbook::consts;
-use crate::scarletbook::types::MasterToc;
+use crate::scarletbook::types::{AreaToc, MasterToc};
 
 pub struct ScarletBookReader {
     reader: SacdNetReader,
     master_toc: MasterToc,
-    stereo_toc_1: Option<StereoToc>,
-    stereo_toc_2: Option<StereoToc>,
+    stereo_toc: Option<AreaToc>,
     stereo_area_index: i32,
     mch_area_index: i32,
 }
@@ -23,8 +22,9 @@ pub fn new(mut reader: SacdNetReader) -> Result<ScarletBookReader> {
             .read_data(
                 master_toc.area_1_toc_1_start,
                 master_toc.area_1_toc_size as u32,
-            )
-            .ok()
+            ).and_then(|tocdata| {
+                AreaToc::from_bytes(&tocdata)
+            }).ok()
     } else {
         warn!("Couldn't read Stereo TOC 1");
         None
@@ -36,16 +36,44 @@ pub fn new(mut reader: SacdNetReader) -> Result<ScarletBookReader> {
             .read_data(
                 master_toc.area_1_toc_2_start,
                 master_toc.area_1_toc_size as u32,
-            )
-            .ok()
+            ).and_then(|tocdata| {
+                AreaToc::from_bytes(&tocdata)
+            }).ok()
     } else {
         warn!("Couldn't read Stereo TOC 2");
         None
     };
 
+    let stereo_toc = match (stereo_toc1, stereo_toc2) {
+        (Some(toc1), Some(toc2)) => {
+            if toc1 == toc2 {
+                // Both exist and are equal - use TOC 1
+                Some(toc1)
+            } else {
+                // By spec, TOC 1 and TOC 2 should be identical/redundant.
+                warn!("Stereo TOC 1 and TOC 2 differ, using backup TOC 2");
+                Some(toc2)
+            }
+        },
+        (Some(toc1), None) => {
+            // Only TOC 1 exists
+            Some(toc1)
+        },
+        (None, Some(toc2)) => {
+            // Only TOC 2 exists
+            Some(toc2)
+        },
+        (None, None) => {
+            warn!("No stereo TOC found");
+            None
+        },
+    };
+
+
     let sbreader = ScarletBookReader {
         reader,
         master_toc,
+        stereo_toc,
         stereo_area_index: -1,
         mch_area_index: -1,
     };
