@@ -1,90 +1,169 @@
+use crate::{
+    sacd_ripper::server_request::Type as req_type,
+    sacd_ripper::server_response::Type as resp_type,
+    sacd_ripper::{ServerRequest, ServerResponse},
+};
 use anyhow::Result;
-use prost::{Message};
+use log::{debug, info};
+use prost::Message;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
-use crate::{sacd_ripper::{ServerResponse, ServerRequest}, sacd_ripper::server_request::Type as req_type, sacd_ripper::server_response::Type as resp_type};
-use log::{debug, info};
 
 pub struct SacdNetReader {
     stream: TcpStream,
 }
 
+impl Drop for SacdNetReader {
+    fn drop(&mut self) {
+        self.close_reader();
+    }
+}
+
+impl SacdNetReader {
+    fn close_reader(&mut self) {
+        let req = ServerRequest {
+            r#type: req_type::DiscClose as i32,
+            sector_offset: Some(0),
+            sector_count: Some(0),
+        };
+
+        let _ = self.send_req(req);
+        debug!("reader dropped and closed");
+    }
+
+    fn send_req(&mut self, req: ServerRequest) -> Result<ServerResponse> {
+        let mut encoded_request = Vec::new();
+        req.encode(&mut encoded_request)?;
+
+        self.stream.write_all(&encoded_request)?;
+
+        // The original C implementation of the ripper protocol
+        // terminates the protobuf payload with a zero.
+        let zero: u8 = 0;
+        self.stream.write_all(&[zero])?;
+        self.stream.flush()?;
+
+        // Read response from the socket.
+        // TCP is a stream protocol - we may need multiple read() calls to get the full message.
+        // Strategy: Read chunks, and after each read, check if we have a zero terminator.
+        // If so, try decoding everything *except* the terminator.
+        let mut buffer = Vec::new();
+        let mut temp_buf = [0u8; 8192];
+        let max_size = 1024 * 1024 + 1024; // 1MB data + overhead
+
+        loop {
+            let bytes_read = self.stream.read(&mut temp_buf)?;
+            if bytes_read == 0 {
+                anyhow::bail!("Connection closed before receiving complete message");
+            }
+
+            buffer.extend_from_slice(&temp_buf[..bytes_read]);
+
+            // Check if we have a zero terminator at the end
+            if buffer.last() == Some(&0) {
+                // Try to decode everything except the terminator
+                let msg_bytes = &buffer[..buffer.len() - 1];
+                match ServerResponse::decode(msg_bytes) {
+                    Ok(response) => {
+                        debug!(
+                            "Successfully decoded message ({} bytes + terminator)",
+                            msg_bytes.len()
+                        );
+                        debug!(
+                            "Decoded response: type={}, result={}",
+                            response.r#type, response.result
+                        );
+                        return Ok(response);
+                    }
+                    Err(err) => {
+                        // Decode failed - we need more data (the zero we found was in the middle of the data)
+                        debug!("incomplete response, reading more");
+                    }
+                }
+            }
+
+            // Safety check
+            if buffer.len() > max_size {
+                anyhow::bail!(
+                    "Message size exceeded maximum ({}MB)",
+                    max_size / (1024 * 1024)
+                );
+            }
+        }
+    }
+
+    /// Read sectors from the disc.
+    ///
+    /// # Arguments
+    /// * `pos` - Starting sector position (sector_offset)
+    /// * `block_count` - Number of sectors to read (sector_count)
+    ///
+    /// # Returns
+    /// * `Ok(Vec<u8>)` - The sector data (each sector is SACD_LSN_SIZE bytes = 2048)
+    /// * `Err` - If the read fails or server doesn't return data
+    pub fn read_data(&mut self, pos: u32, block_count: u32) -> Result<Vec<u8>> {
+        let req = ServerRequest {
+            r#type: req_type::DiscRead as i32,
+            sector_offset: Some(pos),
+            sector_count: Some(block_count),
+        };
+
+        let response = self.send_req(req)?;
+
+        if response.r#type != resp_type::DiscRead as i32 {
+            anyhow::bail!("Expected DISC_READ response, got type {}", response.r#type);
+        }
+
+        // Return data if present
+        // Note: response.result contains the number of sectors actually read
+        if let Some(data) = response.data {
+            let sectors_read = response.result as u32;
+            debug!("Read {} sectors ({} bytes)", sectors_read, data.len());
+            Ok(data)
+        } else {
+            anyhow::bail!(
+                "Server returned DISC_READ response without data (result={})",
+                response.result
+            );
+        }
+    }
+}
+
 pub fn open_network_reader(ip_addr: IpAddr, port: u16) -> Result<SacdNetReader> {
     let socket_addr = SocketAddr::new(ip_addr, port);
-    let mut stream = TcpStream::connect(socket_addr)?;
+    let stream = TcpStream::connect(socket_addr)?;
 
-    let req = ServerRequest{
+    let mut handle = SacdNetReader { stream };
+
+    let req = ServerRequest {
         r#type: req_type::DiscOpen as i32,
         sector_offset: Some(0),
         sector_count: Some(0),
     };
 
-    let mut encoded_request = Vec::new();
-    req.encode(&mut encoded_request)?;
-
-    stream.write_all(&encoded_request)?;
-
-    // The original C implementation of the ripper protocol
-    // terminates the protobuf payload with a zero.
-    let zero: u8 = 0;
-    stream.write_all(&[zero])?;
-    stream.flush()?;
-
-    // Read response into a reasonably sized buffer
-    // We can't read byte-by-byte looking for zero because protobuf messages
-    // contain zero bytes naturally (e.g., when encoding the value 0)
-    //
-    // The server will terminate messages with a zero as well, but we
-    // can't rely fully on that because the proto response might have
-    // zeroes midstream. Fortunately, the C implementation uses nanopb
-    // hard size limits on response payloads - `data` field is capped at 1MB,
-    // and the other fields are fixed, so we can lean on that for reads
-    let mut buffer = vec![0u8; 1024*1024];
-    let bytes_read = stream.read(&mut buffer)?;
-    buffer.truncate(bytes_read);
-
-    // The C protocol appends a zero byte terminator after the protobuf message
-    // We need to strip it before decoding
-    if buffer.is_empty() {
-        anyhow::bail!("No data received from server");
-    }
-
-    debug!("Received {} bytes: {:02x?}", buffer.len(), &buffer[..]);
-
-    if buffer.last() == Some(&0) {
-        buffer.pop();
-    } else {
-        anyhow::bail!("Expected zero terminator byte, got {:02x}", buffer.last().unwrap());
-    }
-
-    // Decode the protobuf message
-    let response = match ServerResponse::decode(&buffer[..]) {
-        Ok(resp) => resp,
-        Err(err) => anyhow::bail!("failed to decode response: {}", err),
-    };
-
-    debug!("Decoded response: type={}, result={}", response.r#type, response.result);
+    let response = handle.send_req(req)?;
 
     // Check the response
     if response.result != 0 || response.r#type != resp_type::DiscOpened as i32 {
         anyhow::bail!("response result non-zero or incorrect type");
     }
 
-    let handle = SacdNetReader{
-        stream,
-    };
-
     Ok(handle)
 }
 
-#[cfg(test)]
-mod tests {
-    use std::net::Ipv4Addr;
+// #[cfg(test)]
+// mod tests {
+//     use std::net::Ipv4Addr;
 
-    use super::*;
+//     use super::*;
 
-    #[test]
-    fn it_works() {
-        let handle = open_network_reader(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 130)), 2002).expect("should init");
-    }
-}
+//     fn init() {
+//         let _ = env_logger::builder().is_test(true).try_init();
+//     }
+
+//     #[test]
+//     fn test_open_network() {
+//         init();
+//         let handle = open_network_reader(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 130)), 2002).expect("should init");
+//     }
+// }
