@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use log::{debug, info, trace};
 use prost::Message;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::path::Path;
 
@@ -226,9 +226,10 @@ impl SacdNetReader {
             (total_sectors as u64 * lsn_size as u64) / (1024 * 1024)
         );
 
-        // Create output file
-        let mut output_file =
-            File::create(output_path.as_ref()).context("Failed to create output file")?;
+        // Create output file with buffered writes
+        let mut output_file = BufWriter::new(
+            File::create(output_path.as_ref()).context("Failed to create output file")?
+        );
 
         let mut current_sector = 0u32;
 
@@ -295,6 +296,8 @@ impl SacdNetReader {
 pub fn open_network_reader(ip_addr: IpAddr, port: u16) -> Result<SacdNetReader> {
     let socket_addr = SocketAddr::new(ip_addr, port);
     let stream = TcpStream::connect(socket_addr).context("couldn't connect to server")?;
+
+    stream.set_nodelay(true).context("couldn't set TCP_NODELAY")?;
 
     let mut handle = SacdNetReader { stream };
 
