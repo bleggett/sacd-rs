@@ -30,6 +30,12 @@ enum Commands {
         /// Output ISO file path
         output: PathBuf,
     },
+    /// Print disc and track information
+    PrintInfo {
+        /// Server address in format IP:PORT (e.g., 192.168.1.130:2002)
+        #[arg(short, long)]
+        server: String,
+    },
 }
 
 fn parse_server_address(server: &str) -> Result<(IpAddr, u16)> {
@@ -83,6 +89,21 @@ fn main() -> Result<()> {
 
             pb.finish_with_message("Complete!");
             println!("ISO dumped successfully to: {}", output.display());
+
+            Ok(())
+        }
+        Commands::PrintInfo { server } => {
+            let (ip, port) = parse_server_address(&server)?;
+
+            println!("Connecting to {}:{}...", ip, port);
+            let handle = sacd_net_reader::open_network_reader(ip, port)
+                .context("Failed to connect to SACD server")?;
+            println!("Connected!");
+
+            let mut sb_reader = scarletbook::reader::new(handle)
+                .context("Failed to read SACD metadata")?;
+
+            sb_reader.print_disc_info();
 
             Ok(())
         }
