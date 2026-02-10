@@ -5,8 +5,9 @@ use log::warn;
 use std::fs::File;
 use std::io::Write;
 
+use crate::scarletbook::area_toc::AreaToc;
 use crate::scarletbook::consts;
-use crate::scarletbook::types::{AreaToc, MasterText, MasterToc};
+use crate::scarletbook::master_toc::{MasterText, MasterToc};
 
 pub struct ScarletBookReader<R: SacdReader> {
     reader: R,

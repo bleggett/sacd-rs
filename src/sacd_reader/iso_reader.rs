@@ -5,16 +5,28 @@ use std::path::Path;
 
 use crate::scarletbook::consts::SACD_LSN_SIZE;
 
+use crate::sacd_reader::SacdReader;
+
 /// SACD ISO file reader
 ///
 /// Reads SACD ISO images and provides sector-level access to the disc data.
 /// Each sector (LSN - Logical Sector Number) is 2048 bytes.
-pub struct SacdIsoReader {
+pub struct IsoReader {
     file: File,
     total_sectors: Option<u32>,
 }
 
-impl SacdIsoReader {
+impl SacdReader for IsoReader {
+    fn read_data(&mut self, start_lsn: u32, sector_count: u32) -> Result<Vec<u8>> {
+        self.read_blocks(start_lsn, sector_count)
+    }
+
+    fn get_total_sectors(&mut self) -> Result<u32> {
+        self.get_total_sectors()
+    }
+}
+
+impl IsoReader {
     /// Open an SACD ISO file
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let file = File::open(path.as_ref())
@@ -33,7 +45,9 @@ impl SacdIsoReader {
         }
 
         // Get file size and calculate number of sectors
-        let file_size = self.file.metadata()
+        let file_size = self
+            .file
+            .metadata()
             .context("Failed to get ISO file metadata")?
             .len();
 
@@ -56,13 +70,18 @@ impl SacdIsoReader {
         let bytes_to_read = (sector_count as usize) * SACD_LSN_SIZE;
 
         // Seek to the start position
-        self.file.seek(SeekFrom::Start(offset))
+        self.file
+            .seek(SeekFrom::Start(offset))
             .with_context(|| format!("Failed to seek to sector {} in ISO", start_lsn))?;
 
         // Read the data
         let mut buffer = vec![0u8; bytes_to_read];
-        self.file.read_exact(&mut buffer)
-            .with_context(|| format!("Failed to read {} sectors from ISO at sector {}", sector_count, start_lsn))?;
+        self.file.read_exact(&mut buffer).with_context(|| {
+            format!(
+                "Failed to read {} sectors from ISO at sector {}",
+                sector_count, start_lsn
+            )
+        })?;
 
         Ok(buffer)
     }

@@ -1,7 +1,5 @@
-mod sacd_iso_reader;
-mod sacd_net_reader;
-mod sacd_reader;
-mod scarletbook;
+pub mod sacd_reader;
+pub mod scarletbook;
 
 pub mod sacd_ripper {
     include!(concat!(env!("OUT_DIR"), "/libsacd.sacd_ripper.rs"));

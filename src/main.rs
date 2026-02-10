@@ -5,10 +5,11 @@ use std::fs;
 use std::net::IpAddr;
 use std::path::PathBuf;
 
-mod sacd_iso_reader;
-mod sacd_net_reader;
 mod sacd_reader;
 mod scarletbook;
+
+use sacd_reader::IsoReader;
+use sacd_reader::NetReader;
 
 pub mod sacd_ripper {
     include!(concat!(env!("OUT_DIR"), "/libsacd.sacd_ripper.rs"));
@@ -93,7 +94,7 @@ fn main() -> Result<()> {
             let (ip, port) = parse_server_address(&server)?;
 
             println!("Connecting to {}:{}...", ip, port);
-            let handle = sacd_net_reader::open_network_reader(ip, port)
+            let handle = NetReader::open_network_reader(ip, port)
                 .context("Failed to connect to SACD server")?;
             println!("Connected!");
 
@@ -105,12 +106,14 @@ fn main() -> Result<()> {
             // Generate ISO filename from disc metadata
             let title = sb_reader
                 .get_master_text()
-                .and_then(|mt| mt.disc_title.as_ref()).cloned()
+                .and_then(|mt| mt.disc_title.as_ref())
+                .cloned()
                 .unwrap_or_else(|| "Unknown_Title".to_string());
 
             let artist = sb_reader
                 .get_master_text()
-                .and_then(|mt| mt.disc_artist.as_ref()).cloned()
+                .and_then(|mt| mt.disc_artist.as_ref())
+                .cloned()
                 .unwrap_or_else(|| "Unknown_Artist".to_string());
 
             let catalog = sb_reader.get_master_toc().disc_catalog();
@@ -195,7 +198,7 @@ fn main() -> Result<()> {
             let (ip, port) = parse_server_address(&server)?;
 
             println!("Connecting to {}:{}...", ip, port);
-            let handle = sacd_net_reader::open_network_reader(ip, port)
+            let handle = NetReader::open_network_reader(ip, port)
                 .context("Failed to connect to SACD server")?;
             println!("Connected!");
 
@@ -223,8 +226,7 @@ fn main() -> Result<()> {
             let extract_mch = multi_channel;
 
             println!("Opening SACD ISO: {}", iso.display());
-            let iso_reader = sacd_iso_reader::SacdIsoReader::open(&iso)
-                .context("Failed to open ISO file")?;
+            let iso_reader = IsoReader::open(&iso).context("Failed to open ISO file")?;
 
             println!("Reading disc metadata...");
             let mut sb_reader = scarletbook::reader::new(iso_reader)
@@ -284,7 +286,9 @@ fn main() -> Result<()> {
                 fs::create_dir_all(&output).context("Failed to create output directory")?;
             }
 
-            println!("\nNote: DSF extraction not yet implemented (Phase 1 complete - ISO reading works!)");
+            println!(
+                "\nNote: DSF extraction not yet implemented (Phase 1 complete - ISO reading works!)"
+            );
             println!("Phase 2 will add DSF writing and audio frame extraction.");
 
             Ok(())
@@ -304,9 +308,11 @@ fn parse_track_selection(tracks: &str) -> Result<Vec<usize>> {
             if range_parts.len() != 2 {
                 anyhow::bail!("Invalid track range: {}", part);
             }
-            let start: usize = range_parts[0].parse()
+            let start: usize = range_parts[0]
+                .parse()
                 .with_context(|| format!("Invalid track number: {}", range_parts[0]))?;
-            let end: usize = range_parts[1].parse()
+            let end: usize = range_parts[1]
+                .parse()
                 .with_context(|| format!("Invalid track number: {}", range_parts[1]))?;
 
             if start == 0 || end == 0 {
@@ -323,7 +329,8 @@ fn parse_track_selection(tracks: &str) -> Result<Vec<usize>> {
             }
         } else {
             // Single track
-            let track: usize = part.parse()
+            let track: usize = part
+                .parse()
                 .with_context(|| format!("Invalid track number: {}", part))?;
             if track == 0 {
                 anyhow::bail!("Track numbers must be 1 or greater");

@@ -1,7 +1,9 @@
 use crate::{
-    sacd_ripper::server_request::Type as req_type,
-    sacd_ripper::server_response::Type as resp_type,
-    sacd_ripper::{ServerRequest, ServerResponse},
+    sacd_reader::SacdReader,
+    sacd_ripper::{
+        ServerRequest, ServerResponse, server_request::Type as req_type,
+        server_response::Type as resp_type,
+    },
 };
 use anyhow::{Context, Result};
 use log::{debug, info, trace};
@@ -11,17 +13,53 @@ use std::io::{BufWriter, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::path::Path;
 
-pub struct SacdNetReader {
+pub struct NetReader {
     stream: TcpStream,
 }
 
-impl Drop for SacdNetReader {
+impl Drop for NetReader {
     fn drop(&mut self) {
         self.close_reader();
     }
 }
 
-impl SacdNetReader {
+impl SacdReader for NetReader {
+    fn read_data(&mut self, start_lsn: u32, sector_count: u32) -> Result<Vec<u8>> {
+        self.read_data(start_lsn, sector_count)
+    }
+
+    fn get_total_sectors(&mut self) -> Result<u32> {
+        self.get_total_sectors()
+    }
+}
+
+impl NetReader {
+    pub fn open_network_reader(ip_addr: IpAddr, port: u16) -> Result<Self> {
+        let socket_addr = SocketAddr::new(ip_addr, port);
+        let stream = TcpStream::connect(socket_addr).context("couldn't connect to server")?;
+
+        stream
+            .set_nodelay(true)
+            .context("couldn't set TCP_NODELAY")?;
+
+        let mut handle = NetReader { stream };
+
+        let req = ServerRequest {
+            r#type: req_type::DiscOpen as i32,
+            sector_offset: Some(0),
+            sector_count: Some(0),
+        };
+
+        let response = handle.send_req(req)?;
+
+        // Check the response
+        if response.result != 0 || response.r#type != resp_type::DiscOpened as i32 {
+            anyhow::bail!("response result non-zero or incorrect type");
+        }
+
+        Ok(handle)
+    }
+
     fn close_reader(&mut self) {
         let req = ServerRequest {
             r#type: req_type::DiscClose as i32,
@@ -291,32 +329,6 @@ impl SacdNetReader {
 
         Ok(total_sectors)
     }
-}
-
-pub fn open_network_reader(ip_addr: IpAddr, port: u16) -> Result<SacdNetReader> {
-    let socket_addr = SocketAddr::new(ip_addr, port);
-    let stream = TcpStream::connect(socket_addr).context("couldn't connect to server")?;
-
-    stream
-        .set_nodelay(true)
-        .context("couldn't set TCP_NODELAY")?;
-
-    let mut handle = SacdNetReader { stream };
-
-    let req = ServerRequest {
-        r#type: req_type::DiscOpen as i32,
-        sector_offset: Some(0),
-        sector_count: Some(0),
-    };
-
-    let response = handle.send_req(req)?;
-
-    // Check the response
-    if response.result != 0 || response.r#type != resp_type::DiscOpened as i32 {
-        anyhow::bail!("response result non-zero or incorrect type");
-    }
-
-    Ok(handle)
 }
 
 // #[cfg(test)]
