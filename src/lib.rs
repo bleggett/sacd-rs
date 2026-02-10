@@ -1,8 +1,7 @@
-use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::net::IpAddr;
 
 mod sacd_net_reader;
 mod scarletbook;
-use log::info;
 use std::path::Path;
 
 pub mod sacd_ripper {

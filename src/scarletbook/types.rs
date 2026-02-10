@@ -1,5 +1,5 @@
 use crate::scarletbook::consts;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use byteorder::{BigEndian, ReadBytesExt};
 use std::io::{self, Cursor, Read};
 
@@ -224,6 +224,72 @@ impl From<u8> for TrackTextType {
             0x88 => TrackTextType::CopyrightPhonetic,
             n => TrackTextType::Unknown(n),
         }
+    }
+}
+
+/// Area_Tracklist_Time (from SACDTRL2)
+/// Track time information for start time or duration
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrackTime {
+    pub minutes: u8,  // Minutes, 1 byte, Uint8, values 0..255
+    pub seconds: u8,  // Seconds, 1 byte, Uint8, values 0..59
+    pub frames: u8,   // Frames, 1 byte, Uint8, values 0..74
+    pub flags: u8,    // Track_Flags, 1 byte; b7=ILP, b4-b1=TMF4-TMF1, b6,b5,b0 reserved
+}
+
+impl TrackTime {
+    fn parse<R: Read>(reader: &mut R) -> io::Result<Self> {
+        Ok(TrackTime {
+            minutes: reader.read_u8()?,
+            seconds: reader.read_u8()?,
+            frames: reader.read_u8()?,
+            flags: reader.read_u8()?,
+        })
+    }
+}
+
+/// ISRC (International Standard Recording Code) from Area_ISRC_Genre (SACD_IGL)
+/// Format: ISRC_Code[tno], 12 bytes, String
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Isrc {
+    pub country_code: [u8; 2],     // Country_Code, 2 bytes, String; ISO-3166-1 alpha-2 (e.g., "GB")
+    pub owner_code: [u8; 3],       // Owner_Code, 3 bytes, String; alphanumeric (e.g., "AAA")
+    pub recording_year: [u8; 2],   // Year_of_Recording, 2 bytes, String; last 2 digits of year (e.g., "94")
+    pub designation_code: [u8; 5], // Designation_Code, 5 bytes, String; numeric (e.g., "00468")
+}
+
+impl Isrc {
+    fn parse<R: Read>(reader: &mut R) -> io::Result<Self> {
+        let mut country_code = [0u8; 2];
+        reader.read_exact(&mut country_code)?;
+        let mut owner_code = [0u8; 3];
+        reader.read_exact(&mut owner_code)?;
+        let mut recording_year = [0u8; 2];
+        reader.read_exact(&mut recording_year)?;
+        let mut designation_code = [0u8; 5];
+        reader.read_exact(&mut designation_code)?;
+
+        Ok(Isrc {
+            country_code,
+            owner_code,
+            recording_year,
+            designation_code,
+        })
+    }
+
+    /// Check if this ISRC has valid data (non-zero country code)
+    pub fn is_valid(&self) -> bool {
+        self.country_code[0] != 0
+    }
+
+    /// Get ISRC as a formatted string (e.g., "GBAAA9400468")
+    pub fn to_string(&self) -> String {
+        let mut result = String::with_capacity(12);
+        result.push_str(&String::from_utf8_lossy(&self.country_code));
+        result.push_str(&String::from_utf8_lossy(&self.owner_code));
+        result.push_str(&String::from_utf8_lossy(&self.recording_year));
+        result.push_str(&String::from_utf8_lossy(&self.designation_code));
+        result
     }
 }
 
@@ -543,6 +609,16 @@ pub struct AreaToc {
     pub copyright_phonetic_offset: u16,
     /// Area_Text
     pub track_texts: Vec<TrackText>,
+
+    // ===== Area_Tracklist_Time (from Track_List_2 / SACDTRL2) =====
+    /// Track_Start[tno], Vec of area_tracklist_time_t, one per track
+    pub track_times_start: Vec<TrackTime>,
+    /// Track_Duration[tno], Vec of area_tracklist_time_t, one per track
+    pub track_times_duration: Vec<TrackTime>,
+
+    // ===== Area_ISRC_Genre (from ISRC_and_Genre_List / SACD_IGL) =====
+    /// ISRC_Code[tno], Vec of isrc_t, one per track; International Standard Recording Code
+    pub track_isrc: Vec<Isrc>,
 }
 
 impl AreaToc {
@@ -673,6 +749,11 @@ impl AreaToc {
         let track_texts =
             Self::parse_track_text(area_data, track_text_offset, track_count, &languages)?;
 
+        // Parse track times and ISRC from complete area data
+        let (track_times_start, track_times_duration) =
+            Self::parse_track_times(area_data, size, track_count)?;
+        let track_isrc = Self::parse_track_isrc(area_data, size, track_count)?;
+
         Ok(AreaToc {
             id,
             version,
@@ -701,6 +782,9 @@ impl AreaToc {
             area_description_phonetic_offset,
             copyright_phonetic_offset,
             track_texts,
+            track_times_start,
+            track_times_duration,
+            track_isrc,
         })
     }
 
@@ -851,5 +935,114 @@ impl AreaToc {
         }
 
         Ok(track_texts)
+    }
+
+    /// Parse Area_Tracklist_Time (Track_List_2) from the raw area data
+    ///
+    /// Searches for "SACDTRL2" (Track_List_2_Signature) sector containing:
+    /// - Track_Start[255]: area_tracklist_time_t array for start times
+    /// - Track_Duration[255]: area_tracklist_time_t array for durations
+    ///
+    /// # Arguments
+    /// * `area_data` - Complete area data (multiple sectors, starting from Area TOC)
+    /// * `size` - Area_TOC_Length in sectors
+    /// * `track_count` - N_Tracks (1..255)
+    ///
+    /// # Returns
+    /// Tuple of (Track_Start[], Track_Duration[]) vectors
+    fn parse_track_times(
+        area_data: &[u8],
+        size: u16,
+        track_count: u8,
+    ) -> Result<(Vec<TrackTime>, Vec<TrackTime>)> {
+        // Search for SACDTRL2 signature
+        let mut offset = consts::SACD_LSN_SIZE; // Skip first sector (Area TOC header)
+        let end_offset = (size as usize) * consts::SACD_LSN_SIZE;
+
+        while offset + 8 <= end_offset {
+            if &area_data[offset..offset + 8] == b"SACDTRL2" {
+                // Found track time list
+                let mut reader = Cursor::new(&area_data[offset..]);
+
+                // Skip signature
+                reader.set_position(8);
+
+                let mut start_times = Vec::with_capacity(track_count as usize);
+                let mut durations = Vec::with_capacity(track_count as usize);
+
+                // SACDTRL2 structure has 255 fixed entries for start times
+                // Read all 255 start times, but only keep track_count entries
+                for i in 0..255 {
+                    let time = TrackTime::parse(&mut reader)?;
+                    if i < track_count {
+                        start_times.push(time);
+                    }
+                }
+
+                // Then read all 255 durations, but only keep track_count entries
+                for i in 0..255 {
+                    let time = TrackTime::parse(&mut reader)?;
+                    if i < track_count {
+                        durations.push(time);
+                    }
+                }
+
+                return Ok((start_times, durations));
+            }
+            offset += consts::SACD_LSN_SIZE;
+        }
+
+        // If not found, return empty vectors
+        Ok((vec![], vec![]))
+    }
+
+    /// Parse Area_ISRC_Genre (ISRC_and_Genre_List) from the raw area data
+    ///
+    /// Searches for "SACD_IGL" (ISRC_and_Genre_List_Signature) sector containing:
+    /// - ISRC_Code[255]: isrc_t array (12 bytes each)
+    /// - Track_Genre[255]: genre_table_t array (4 bytes each)
+    ///
+    /// # Arguments
+    /// * `area_data` - Complete area data (multiple sectors, starting from Area TOC)
+    /// * `size` - Area_TOC_Length in sectors
+    /// * `track_count` - N_Tracks (1..255)
+    ///
+    /// # Returns
+    /// Vector of ISRC_Code[] (one per track)
+    fn parse_track_isrc(
+        area_data: &[u8],
+        size: u16,
+        track_count: u8,
+    ) -> Result<Vec<Isrc>> {
+        // Search for SACD_IGL signature
+        let mut offset = consts::SACD_LSN_SIZE; // Skip first sector (Area TOC header)
+        let end_offset = (size as usize) * consts::SACD_LSN_SIZE;
+
+        while offset + 8 <= end_offset {
+            if &area_data[offset..offset + 8] == b"SACD_IGL" {
+                // Found ISRC and genre list
+                let mut reader = Cursor::new(&area_data[offset..]);
+
+                // Skip signature
+                reader.set_position(8);
+
+                let mut isrc_codes = Vec::with_capacity(track_count as usize);
+
+                // SACD_IGL structure has 255 fixed ISRC entries
+                // Read all 255 ISRC codes, but only keep track_count entries
+                for i in 0..255 {
+                    let isrc = Isrc::parse(&mut reader)?;
+                    if i < track_count {
+                        isrc_codes.push(isrc);
+                    }
+                }
+
+                return Ok(isrc_codes);
+            }
+            offset += consts::SACD_LSN_SIZE;
+        }
+
+        // If not found, return empty vector
+        Ok(vec![])
     }
 }

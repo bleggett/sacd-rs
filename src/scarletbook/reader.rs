@@ -1,9 +1,6 @@
 use crate::sacd_net_reader::SacdNetReader;
 use anyhow::{Context, Result};
-use log::{debug, info, warn};
-use std::fs::File;
-use std::io::Write;
-use std::path::Path;
+use log::warn;
 
 use crate::scarletbook::consts;
 use crate::scarletbook::types::{AreaToc, MasterToc, MasterText};
@@ -79,14 +76,14 @@ impl ScarletBookReader {
             let lang_code = lang_code.trim_end_matches('\0');
             if !lang_code.is_empty() {
                 let charset_name = match locale.character_set & 0x07 {
-                    0 => "Reserved",
-                    1 => "ISO646",
-                    2 => "ISO8859-1",
-                    3 => "Music Shift-JIS",
-                    4 => "Korean KSC 5601-1989",
-                    5 => "Mandarin GB 2312-80",
-                    6 => "Chinese Big5",
-                    7 => "ISO8859-1",
+                    0 => "US-ASCII",
+                    1 => "ISO646-JP",
+                    2 => "ISO-8859-1",
+                    3 => "SHIFT_JISX0213",
+                    4 => "KSC5601.1987-0",
+                    5 => "GB2312.1980-0",
+                    6 => "BIG5",
+                    7 => "ISO-8859-1",
                     _ => "Unknown",
                 };
                 println!("    Locale: {}, Code character set:[{}], {}",
@@ -171,9 +168,31 @@ impl ScarletBookReader {
                 println!("        Composer[{}]: {}", i, composer);
             }
 
-            // TODO: Print track start time and duration from area_tracklist_time
-            // TODO: Print ISRC information from area_isrc_genre
+            // Print track start time and duration from Area_Tracklist_Time (SACDTRL2)
+            if i < area_toc.track_times_start.len() && i < area_toc.track_times_duration.len() {
+                let start = &area_toc.track_times_start[i];
+                let duration = &area_toc.track_times_duration[i];
+                println!("        Track_Start_Time_Code: {:02}:{:02}:{:02} [mins:secs:frames]",
+                    start.minutes, start.seconds, start.frames);
+                println!("        Duration: {:02}:{:02}:{:02} [mins:secs:frames]",
+                    duration.minutes, duration.seconds, duration.frames);
+            }
+
             println!();
+        }
+
+        // Print ISRC information from Area_ISRC_Genre (SACD_IGL)
+        for (i, isrc) in area_toc.track_isrc.iter().enumerate() {
+            if isrc.is_valid() {
+                let country = String::from_utf8_lossy(&isrc.country_code);
+                let owner = String::from_utf8_lossy(&isrc.owner_code);
+                let year = String::from_utf8_lossy(&isrc.recording_year);
+                let designation = String::from_utf8_lossy(&isrc.designation_code);
+
+                println!("    ISRC Track [{}]:", i);
+                println!("      Country: {}, Owner: {}, Year: {}, Designation: {}",
+                    country, owner, year, designation);
+            }
         }
     }
 
