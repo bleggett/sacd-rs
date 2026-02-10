@@ -1,4 +1,4 @@
-use crate::sacd_net_reader::SacdNetReader;
+use crate::sacd_reader::SacdReader;
 use anyhow::{Context, Result};
 use chrono;
 use log::warn;
@@ -8,8 +8,8 @@ use std::io::Write;
 use crate::scarletbook::consts;
 use crate::scarletbook::types::{AreaToc, MasterText, MasterToc};
 
-pub struct ScarletBookReader {
-    reader: SacdNetReader,
+pub struct ScarletBookReader<R: SacdReader> {
+    reader: R,
     master_toc: MasterToc,
     master_text: Option<MasterText>,
     stereo_toc: Option<AreaToc>,
@@ -17,7 +17,7 @@ pub struct ScarletBookReader {
     total_sectors: Option<u32>,
 }
 
-pub fn new(mut reader: SacdNetReader) -> Result<ScarletBookReader> {
+pub fn new<R: SacdReader>(mut reader: R) -> Result<ScarletBookReader<R>> {
     let master_toc = read_master_toc(&mut reader)?;
 
     let master_text = read_master_text(&mut reader);
@@ -37,7 +37,7 @@ pub fn new(mut reader: SacdNetReader) -> Result<ScarletBookReader> {
     Ok(sbreader)
 }
 
-impl ScarletBookReader {
+impl<R: SacdReader> ScarletBookReader<R> {
     pub fn get_master_toc(&self) -> MasterToc {
         self.master_toc.clone()
     }
@@ -54,7 +54,7 @@ impl ScarletBookReader {
         self.master_text.as_ref()
     }
 
-    pub fn get_reader_mut(&mut self) -> &mut SacdNetReader {
+    pub fn get_reader_mut(&mut self) -> &mut R {
         &mut self.reader
     }
 
@@ -350,14 +350,14 @@ impl ScarletBookReader {
     }
 }
 
-fn read_master_toc(reader: &mut SacdNetReader) -> Result<MasterToc> {
+fn read_master_toc<R: SacdReader>(reader: &mut R) -> Result<MasterToc> {
     let res = reader
         .read_data(consts::START_OF_MASTER_TOC, consts::MASTER_TOC_LEN)
         .context("couldn't read master TOC bytes")?;
     MasterToc::from_bytes(&res).context("couldn't parse master TOC bytes")
 }
 
-fn read_master_text(reader: &mut SacdNetReader) -> Option<MasterText> {
+fn read_master_text<R: SacdReader>(reader: &mut R) -> Option<MasterText> {
     // Master text is at sector 511 (START_OF_MASTER_TOC + 1)
     // Read 1 sector (2048 bytes)
     let master_text_sector = consts::START_OF_MASTER_TOC + 1;
@@ -367,7 +367,7 @@ fn read_master_text(reader: &mut SacdNetReader) -> Option<MasterText> {
         .ok()
 }
 
-fn read_stereo_toc(master_toc: &MasterToc, reader: &mut SacdNetReader) -> Option<AreaToc> {
+fn read_stereo_toc<R: SacdReader>(master_toc: &MasterToc, reader: &mut R) -> Option<AreaToc> {
     // Look for stereo TOC 1
     let stereo_toc1 = if master_toc.area_1_toc_1_start > 0 {
         reader
@@ -422,7 +422,7 @@ fn read_stereo_toc(master_toc: &MasterToc, reader: &mut SacdNetReader) -> Option
     }
 }
 
-fn read_mch_toc(master_toc: &MasterToc, reader: &mut SacdNetReader) -> Option<AreaToc> {
+fn read_mch_toc<R: SacdReader>(master_toc: &MasterToc, reader: &mut R) -> Option<AreaToc> {
     // Look for multichannel TOC 1
     let mch_toc1 = if master_toc.area_2_toc_1_start > 0 {
         reader

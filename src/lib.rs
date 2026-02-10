@@ -1,4 +1,6 @@
+mod sacd_iso_reader;
 mod sacd_net_reader;
+mod sacd_reader;
 mod scarletbook;
 
 pub mod sacd_ripper {
