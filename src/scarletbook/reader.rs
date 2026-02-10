@@ -1,6 +1,9 @@
 use crate::sacd_net_reader::SacdNetReader;
 use anyhow::{Context, Result};
+use chrono;
 use log::warn;
+use std::fs::File;
+use std::io::Write;
 
 use crate::scarletbook::consts;
 use crate::scarletbook::types::{AreaToc, MasterToc, MasterText};
@@ -44,30 +47,63 @@ impl ScarletBookReader {
         self.stereo_toc.clone()
     }
 
-    /// Print disc and track information to stdout
-    pub fn print_disc_info(&mut self) {
-        self.print_disc_info_section();
-        self.print_album_info_section();
-        self.print_area_count();
-
-        if let Some(ref stereo_toc) = self.stereo_toc {
-            self.print_area_toc(stereo_toc, 0);
-        }
-
-        self.print_disc_size();
+    pub fn get_master_text(&self) -> Option<&MasterText> {
+        self.master_text.as_ref()
     }
 
-    fn print_disc_info_section(&self) {
+    pub fn get_reader_mut(&mut self) -> &mut SacdNetReader {
+        &mut self.reader
+    }
+
+    /// Print disc and track information to stdout
+    pub fn print_disc_info(&mut self) {
+        let stdout = std::io::stdout();
+        let mut handle = stdout.lock();
+        let _ = self.write_disc_info(&mut handle);
+    }
+
+    /// Write disc and track information to any Write implementation
+    fn write_disc_info<W: Write>(&mut self, writer: &mut W) -> Result<()> {
+        self.write_version_info(writer)?;
+        self.write_disc_info_section(writer)?;
+        self.write_album_info_section(writer)?;
+        self.write_area_count(writer)?;
+
+        if let Some(ref stereo_toc) = self.stereo_toc {
+            self.write_area_toc(writer, stereo_toc, 0)?;
+        }
+
+        self.write_disc_size(writer)?;
+        Ok(())
+    }
+
+    /// Write version and current date
+    fn write_version_info<W: Write>(&self, writer: &mut W) -> Result<()> {
+        let now = chrono::Local::now();
+        writeln!(writer, "sacd-rs version {} ({})",
+            env!("CARGO_PKG_VERSION"),
+            now.format("%Y-%m-%d"))?;
+        writeln!(writer)?;
+        Ok(())
+    }
+
+    /// Write disc and track information to a file
+    pub fn write_disc_info_to_file<P: AsRef<std::path::Path>>(&mut self, path: P) -> Result<()> {
+        let mut file = File::create(path)?;
+        self.write_disc_info(&mut file)
+    }
+
+    fn write_disc_info_section<W: Write>(&self, writer: &mut W) -> Result<()> {
         let mtoc = &self.master_toc;
 
-        println!("Disc Information:");
-        println!("    Version: {:2}.{:02}", mtoc.version.major, mtoc.version.minor);
-        println!("    Creation date: {:04}-{:02}-{:02}",
-            mtoc.disc_date_year, mtoc.disc_date_month, mtoc.disc_date_day);
+        writeln!(writer, "Disc Information:")?;
+        writeln!(writer, "    Version: {:2}.{:02}", mtoc.version.major, mtoc.version.minor)?;
+        writeln!(writer, "    Creation date: {:04}-{:02}-{:02}",
+            mtoc.disc_date_year, mtoc.disc_date_month, mtoc.disc_date_day)?;
 
         let disc_catalog = mtoc.disc_catalog();
         if !disc_catalog.is_empty() {
-            println!("    Disc Catalog Number: {}", disc_catalog);
+            writeln!(writer, "    Disc Catalog Number: {}", disc_catalog)?;
         }
 
         // Print locales
@@ -86,99 +122,105 @@ impl ScarletBookReader {
                     7 => "ISO-8859-1",
                     _ => "Unknown",
                 };
-                println!("    Locale: {}, Code character set:[{}], {}",
-                    lang_code, locale.character_set, charset_name);
+                writeln!(writer, "    Locale: {}, Code character set:[{}], {}",
+                    lang_code, locale.character_set, charset_name)?;
             }
         }
 
         // Print disc text from master text
         if let Some(ref mt) = self.master_text {
             if let Some(ref title) = mt.disc_title {
-                println!("    Title: {}", title);
+                writeln!(writer, "    Title: {}", title)?;
             }
             if let Some(ref artist) = mt.disc_artist {
-                println!("    Artist: {}", artist);
+                writeln!(writer, "    Artist: {}", artist)?;
             }
             if let Some(ref publisher) = mt.disc_publisher {
-                println!("    Publisher: {}", publisher);
+                writeln!(writer, "    Publisher: {}", publisher)?;
             }
             if let Some(ref copyright) = mt.disc_copyright {
-                println!("    Copyright: {}", copyright);
+                writeln!(writer, "    Copyright: {}", copyright)?;
             }
         }
+        Ok(())
     }
 
-    fn print_album_info_section(&self) {
+    fn write_album_info_section<W: Write>(&self, writer: &mut W) -> Result<()> {
         let mtoc = &self.master_toc;
 
-        println!("\nAlbum Information:");
+        writeln!(writer)?;
+        writeln!(writer, "Album Information:")?;
 
         let album_catalog = String::from_utf8_lossy(&mtoc.album_catalog_number)
             .trim_end_matches('\0')
             .trim()
             .to_string();
         if !album_catalog.is_empty() {
-            println!("    Album Catalog Number: {}", album_catalog);
+            writeln!(writer, "    Album Catalog Number: {}", album_catalog)?;
         }
 
-        println!("    Sequence Number: {}", mtoc.album_sequence_number);
-        println!("    Set Size: {}", mtoc.album_set_size);
+        writeln!(writer, "    Sequence Number: {}", mtoc.album_sequence_number)?;
+        writeln!(writer, "    Set Size: {}", mtoc.album_set_size)?;
 
         // Print album text from master text
         if let Some(ref mt) = self.master_text {
             if let Some(ref title) = mt.album_title {
-                println!("    Title: {}", title);
+                writeln!(writer, "    Title: {}", title)?;
             }
             if let Some(ref artist) = mt.album_artist {
-                println!("    Artist: {}", artist);
+                writeln!(writer, "    Artist: {}", artist)?;
             }
             if let Some(ref publisher) = mt.album_publisher {
-                println!("    Publisher: {}", publisher);
+                writeln!(writer, "    Publisher: {}", publisher)?;
             }
             if let Some(ref copyright) = mt.album_copyright {
-                println!("    Copyright: {}", copyright);
+                writeln!(writer, "    Copyright: {}", copyright)?;
             }
         }
+        Ok(())
     }
 
-    fn print_area_count(&self) {
+    fn write_area_count<W: Write>(&self, writer: &mut W) -> Result<()> {
         let area_count = if self.stereo_toc.is_some() { 1 } else { 0 };
-        println!("\nArea count: {}", area_count);
+        writeln!(writer)?;
+        writeln!(writer, "Area count: {}", area_count)?;
+        Ok(())
     }
 
-    fn print_area_toc(&self, area_toc: &AreaToc, area_idx: usize) {
-        println!("    Area Information [{}]:\n", area_idx);
-        println!("    Version: {:2}.{:02}", area_toc.version.major, area_toc.version.minor);
-        println!("    Track Count: {}", area_toc.track_count);
-        println!("    Total play time: {:02}:{:02}:{:02} [mins:secs:frames]",
+    fn write_area_toc<W: Write>(&self, writer: &mut W, area_toc: &AreaToc, area_idx: usize) -> Result<()> {
+        writeln!(writer, "    Area Information [{}]:", area_idx)?;
+        writeln!(writer)?;
+        writeln!(writer, "    Version: {:2}.{:02}", area_toc.version.major, area_toc.version.minor)?;
+        writeln!(writer, "    Track Count: {}", area_toc.track_count)?;
+        writeln!(writer, "    Total play time: {:02}:{:02}:{:02} [mins:secs:frames]",
             area_toc.total_playtime.minutes,
             area_toc.total_playtime.seconds,
-            area_toc.total_playtime.frames);
-        println!("    Speaker config: {} Channel", area_toc.channel_count);
+            area_toc.total_playtime.frames)?;
+        writeln!(writer, "    Speaker config: {} Channel", area_toc.channel_count)?;
 
-        println!("    Track list [{}]:", area_idx);
+        writeln!(writer, "    Track list [{}]:", area_idx)?;
         for (i, track_text) in area_toc.track_texts.iter().enumerate() {
             if let Some(ref title) = track_text.title {
-                println!("        Title[{}]: {}", i, title);
+                writeln!(writer, "        Title[{}]: {}", i, title)?;
             }
             if let Some(ref performer) = track_text.performer {
-                println!("        Performer[{}]: {}", i, performer);
+                writeln!(writer, "        Performer[{}]: {}", i, performer)?;
             }
             if let Some(ref composer) = track_text.composer {
-                println!("        Composer[{}]: {}", i, composer);
+                writeln!(writer, "        Composer[{}]: {}", i, composer)?;
             }
 
             // Print track start time and duration from Area_Tracklist_Time (SACDTRL2)
             if i < area_toc.track_times_start.len() && i < area_toc.track_times_duration.len() {
                 let start = &area_toc.track_times_start[i];
                 let duration = &area_toc.track_times_duration[i];
-                println!("        Track_Start_Time_Code: {:02}:{:02}:{:02} [mins:secs:frames]",
-                    start.minutes, start.seconds, start.frames);
-                println!("        Duration: {:02}:{:02}:{:02} [mins:secs:frames]",
-                    duration.minutes, duration.seconds, duration.frames);
+                writeln!(writer, "        Track_Start_Time_Code: {:02}:{:02}:{:02} [mins:secs:frames]",
+                    start.minutes, start.seconds, start.frames)?;
+                writeln!(writer, "        Duration: {:02}:{:02}:{:02} [mins:secs:frames]",
+                    duration.minutes, duration.seconds, duration.frames)?;
             }
 
-            println!();
+            writeln!(writer)?;
         }
 
         // Print ISRC information from Area_ISRC_Genre (SACD_IGL)
@@ -189,11 +231,12 @@ impl ScarletBookReader {
                 let year = String::from_utf8_lossy(&isrc.recording_year);
                 let designation = String::from_utf8_lossy(&isrc.designation_code);
 
-                println!("    ISRC Track [{}]:", i);
-                println!("      Country: {}, Owner: {}, Year: {}, Designation: {}",
-                    country, owner, year, designation);
+                writeln!(writer, "    ISRC Track [{}]:", i)?;
+                writeln!(writer, "      Country: {}, Owner: {}, Year: {}, Designation: {}",
+                    country, owner, year, designation)?;
             }
         }
+        Ok(())
     }
 
     fn get_total_sectors(&mut self) -> Result<u32> {
@@ -206,16 +249,18 @@ impl ScarletBookReader {
         }
     }
 
-    fn print_disc_size(&mut self) {
+    fn write_disc_size<W: Write>(&mut self, writer: &mut W) -> Result<()> {
         if let Ok(total_sectors) = self.get_total_sectors() {
             const SACD_LSN_SIZE: u64 = 2048;
             let total_bytes = total_sectors as u64 * SACD_LSN_SIZE;
             // C code uses 1000^3 for "gigabyte" (not 1024^3)
             let gb = total_bytes as f64 / (1000.0 * 1000.0 * 1000.0);
 
-            println!("\nThe size of sacd is ok (sectors={}). Size is: {} bytes, {:.3} GB (gigabyte)",
-                total_sectors, total_bytes, gb);
+            writeln!(writer)?;
+            writeln!(writer, "The size of sacd is ok (sectors={}). Size is: {} bytes, {:.3} GB (gigabyte)",
+                total_sectors, total_bytes, gb)?;
         }
+        Ok(())
     }
 }
 

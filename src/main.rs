@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
+use std::fs;
 use std::net::IpAddr;
 use std::path::PathBuf;
 
@@ -27,8 +28,13 @@ enum Commands {
         #[arg(short, long)]
         server: String,
 
-        /// Output ISO file path
+        /// Output directory for the ISO file
+        /// The ISO will be named: <disc_title>-<disc_artist>-[disc_catalog].iso
         output: PathBuf,
+
+        /// Write disc information to a text file alongside the ISO
+        #[arg(short, long)]
+        write_info: bool,
     },
     /// Print disc and track information
     PrintInfo {
@@ -60,13 +66,81 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::DumpIso { server, output } => {
+        Commands::DumpIso { server, output, write_info } => {
             let (ip, port) = parse_server_address(&server)?;
 
             println!("Connecting to {}:{}...", ip, port);
-            let mut handle = sacd_net_reader::open_network_reader(ip, port)
+            let handle = sacd_net_reader::open_network_reader(ip, port)
                 .context("Failed to connect to SACD server")?;
             println!("Connected!");
+
+            // Read disc info to generate filename
+            println!("Reading disc information...");
+            let mut sb_reader = scarletbook::reader::new(handle)
+                .context("Failed to read SACD metadata")?;
+
+            // Generate ISO filename from disc metadata
+            let title = sb_reader.get_master_text()
+                .and_then(|mt| mt.disc_title.as_ref())
+                .map(|s| s.clone())
+                .unwrap_or_else(|| "Unknown_Title".to_string());
+
+            let artist = sb_reader.get_master_text()
+                .and_then(|mt| mt.disc_artist.as_ref())
+                .map(|s| s.clone())
+                .unwrap_or_else(|| "Unknown_Artist".to_string());
+
+            let catalog = sb_reader.get_master_toc().disc_catalog();
+            let catalog = if catalog.is_empty() {
+                "Unknown_Catalog".to_string()
+            } else {
+                catalog
+            };
+
+            // Sanitize filename components (remove invalid characters but keep spaces)
+            fn sanitize_filename(s: &str) -> String {
+                s.chars()
+                    .map(|c| match c {
+                        '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+                        c if c.is_control() => '_',
+                        c => c,
+                    })
+                    .collect::<String>()
+                    .trim()
+                    .to_string()
+            }
+
+            let iso_filename = format!("{}-{}-[{}].iso",
+                sanitize_filename(&title),
+                sanitize_filename(&artist),
+                sanitize_filename(&catalog)
+            );
+
+            println!("Disc: {}", iso_filename);
+
+            // Create output directory if it doesn't exist
+            if !output.exists() {
+                fs::create_dir_all(&output)
+                    .context("Failed to create output directory")?;
+            }
+
+            // Build full output path
+            let output_path = output.join(&iso_filename);
+            println!("Output: {}", output_path.display());
+
+            // Write disc info to text file if requested
+            if write_info {
+                let info_filename = format!("{}-{}-[{}].txt",
+                    sanitize_filename(&title),
+                    sanitize_filename(&artist),
+                    sanitize_filename(&catalog)
+                );
+                let info_path = output.join(&info_filename);
+
+                println!("Writing disc info to: {}", info_path.display());
+                sb_reader.write_disc_info_to_file(&info_path)
+                    .context("Failed to write disc info file")?;
+            }
 
             let pb = ProgressBar::new(0);
             pb.set_style(
@@ -76,8 +150,8 @@ fn main() -> Result<()> {
                     .progress_chars("#>-")
             );
 
-            handle.dump_iso(
-                &output,
+            sb_reader.get_reader_mut().dump_iso(
+                &output_path,
                 scarletbook::consts::SACD_LSN_SIZE,
                 Some(|current, total| {
                     if pb.length().unwrap_or(0) == 0 {
@@ -88,7 +162,7 @@ fn main() -> Result<()> {
             )?;
 
             pb.finish_with_message("Complete!");
-            println!("ISO dumped successfully to: {}", output.display());
+            println!("ISO dumped successfully to: {}", output_path.display());
 
             Ok(())
         }
