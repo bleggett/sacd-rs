@@ -1,13 +1,15 @@
-use crate::sacd_reader::SacdReader;
 use anyhow::{Context, Result};
 use chrono;
 use log::warn;
 use std::fs::File;
 use std::io::Write;
 
-use crate::scarletbook::area_toc::AreaToc;
-use crate::scarletbook::consts;
-use crate::scarletbook::master_toc::{MasterText, MasterToc};
+use crate::sacd_reader::SacdReader;
+use crate::scarletbook::{
+    area_toc::AreaToc,
+    consts,
+    master_toc::{MasterText, MasterToc},
+};
 
 pub struct ScarletBookReader<R: SacdReader> {
     reader: R,

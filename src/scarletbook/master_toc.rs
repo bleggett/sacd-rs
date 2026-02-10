@@ -63,10 +63,10 @@ impl MasterToc {
         reader.read_exact(&mut album_catalog_number)?;
 
         let album_genre = [
-            types::GenreTable::read_from(reader)?,
-            types::GenreTable::read_from(reader)?,
-            types::GenreTable::read_from(reader)?,
-            types::GenreTable::read_from(reader)?,
+            types::GenreTable::parse(reader)?,
+            types::GenreTable::parse(reader)?,
+            types::GenreTable::parse(reader)?,
+            types::GenreTable::parse(reader)?,
         ];
 
         let mut reserved03 = [0u8; 8];
@@ -89,10 +89,10 @@ impl MasterToc {
         reader.read_exact(&mut disc_catalog_number)?;
 
         let disc_genre = [
-            types::GenreTable::read_from(reader)?,
-            types::GenreTable::read_from(reader)?,
-            types::GenreTable::read_from(reader)?,
-            types::GenreTable::read_from(reader)?,
+            types::GenreTable::parse(reader)?,
+            types::GenreTable::parse(reader)?,
+            types::GenreTable::parse(reader)?,
+            types::GenreTable::parse(reader)?,
         ];
 
         let disc_date_year = reader.read_u16::<BigEndian>()?;
