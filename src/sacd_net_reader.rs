@@ -228,7 +228,7 @@ impl SacdNetReader {
 
         // Create output file with buffered writes
         let mut output_file = BufWriter::new(
-            File::create(output_path.as_ref()).context("Failed to create output file")?
+            File::create(output_path.as_ref()).context("Failed to create output file")?,
         );
 
         let mut current_sector = 0u32;
@@ -275,7 +275,7 @@ impl SacdNetReader {
                 callback(current_sector, total_sectors);
             }
 
-            if current_sector % 10240 == 0 || current_sector == total_sectors {
+            if current_sector.is_multiple_of(10240) || current_sector == total_sectors {
                 info!(
                     "Finished: {}/{} sectors ({:.1}%)",
                     current_sector,
@@ -297,7 +297,9 @@ pub fn open_network_reader(ip_addr: IpAddr, port: u16) -> Result<SacdNetReader> 
     let socket_addr = SocketAddr::new(ip_addr, port);
     let stream = TcpStream::connect(socket_addr).context("couldn't connect to server")?;
 
-    stream.set_nodelay(true).context("couldn't set TCP_NODELAY")?;
+    stream
+        .set_nodelay(true)
+        .context("couldn't set TCP_NODELAY")?;
 
     let mut handle = SacdNetReader { stream };
 

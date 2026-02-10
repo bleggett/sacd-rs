@@ -50,12 +50,8 @@ fn parse_server_address(server: &str) -> Result<(IpAddr, u16)> {
         anyhow::bail!("Server address must be in format IP:PORT (e.g., 192.168.1.130:2002)");
     }
 
-    let ip: IpAddr = parts[0]
-        .parse()
-        .context("Invalid IP address")?;
-    let port: u16 = parts[1]
-        .parse()
-        .context("Invalid port number")?;
+    let ip: IpAddr = parts[0].parse().context("Invalid IP address")?;
+    let port: u16 = parts[1].parse().context("Invalid port number")?;
 
     Ok((ip, port))
 }
@@ -66,7 +62,11 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::DumpIso { server, output, write_info } => {
+        Commands::DumpIso {
+            server,
+            output,
+            write_info,
+        } => {
             let (ip, port) = parse_server_address(&server)?;
 
             println!("Connecting to {}:{}...", ip, port);
@@ -76,18 +76,18 @@ fn main() -> Result<()> {
 
             // Read disc info to generate filename
             println!("Reading disc information...");
-            let mut sb_reader = scarletbook::reader::new(handle)
-                .context("Failed to read SACD metadata")?;
+            let mut sb_reader =
+                scarletbook::reader::new(handle).context("Failed to read SACD metadata")?;
 
             // Generate ISO filename from disc metadata
-            let title = sb_reader.get_master_text()
-                .and_then(|mt| mt.disc_title.as_ref())
-                .map(|s| s.clone())
+            let title = sb_reader
+                .get_master_text()
+                .and_then(|mt| mt.disc_title.as_ref()).cloned()
                 .unwrap_or_else(|| "Unknown_Title".to_string());
 
-            let artist = sb_reader.get_master_text()
-                .and_then(|mt| mt.disc_artist.as_ref())
-                .map(|s| s.clone())
+            let artist = sb_reader
+                .get_master_text()
+                .and_then(|mt| mt.disc_artist.as_ref()).cloned()
                 .unwrap_or_else(|| "Unknown_Artist".to_string());
 
             let catalog = sb_reader.get_master_toc().disc_catalog();
@@ -110,7 +110,8 @@ fn main() -> Result<()> {
                     .to_string()
             }
 
-            let iso_filename = format!("{}-{}-[{}].iso",
+            let iso_filename = format!(
+                "{}-{}-[{}].iso",
                 sanitize_filename(&title),
                 sanitize_filename(&artist),
                 sanitize_filename(&catalog)
@@ -120,8 +121,7 @@ fn main() -> Result<()> {
 
             // Create output directory if it doesn't exist
             if !output.exists() {
-                fs::create_dir_all(&output)
-                    .context("Failed to create output directory")?;
+                fs::create_dir_all(&output).context("Failed to create output directory")?;
             }
 
             // Build full output path
@@ -130,7 +130,8 @@ fn main() -> Result<()> {
 
             // Write disc info to text file if requested
             if write_info {
-                let info_filename = format!("{}-{}-[{}].txt",
+                let info_filename = format!(
+                    "{}-{}-[{}].txt",
                     sanitize_filename(&title),
                     sanitize_filename(&artist),
                     sanitize_filename(&catalog)
@@ -138,7 +139,8 @@ fn main() -> Result<()> {
                 let info_path = output.join(&info_filename);
 
                 println!("Writing disc info to: {}", info_path.display());
-                sb_reader.write_disc_info_to_file(&info_path)
+                sb_reader
+                    .write_disc_info_to_file(&info_path)
                     .context("Failed to write disc info file")?;
             }
 
@@ -174,8 +176,8 @@ fn main() -> Result<()> {
                 .context("Failed to connect to SACD server")?;
             println!("Connected!");
 
-            let mut sb_reader = scarletbook::reader::new(handle)
-                .context("Failed to read SACD metadata")?;
+            let mut sb_reader =
+                scarletbook::reader::new(handle).context("Failed to read SACD metadata")?;
 
             sb_reader.print_disc_info();
 

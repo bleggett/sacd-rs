@@ -61,11 +61,7 @@ impl MasterText {
             let s = String::from_utf8_lossy(&bytes[start..end])
                 .trim()
                 .to_string();
-            if s.is_empty() {
-                None
-            } else {
-                Some(s)
-            }
+            if s.is_empty() { None } else { Some(s) }
         };
 
         Ok(MasterText {
@@ -129,9 +125,9 @@ impl PlayTime {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GenreTable {
-    pub category: u8,
+    pub category: u8, // Genre_Table_Category, 1 byte, Uint8; 0=Not used, 1=General, 2=Japanese
     pub reserved: u8,
-    pub genre: u16,
+    pub genre: u16, // Genre_Table_Genre, 2 bytes, Uint16
 }
 
 impl GenreTable {
@@ -141,6 +137,25 @@ impl GenreTable {
             reserved: reader.read_u8()?,
             genre: reader.read_u16::<BigEndian>()?,
         })
+    }
+
+    /// Get category name
+    pub fn category_name(&self) -> Option<&'static str> {
+        match self.category {
+            0 => Some("Not used"),
+            1 => Some("General"),
+            2 => Some("Japanese"),
+            _ => None,
+        }
+    }
+
+    /// Get genre name (only valid when category == 1)
+    pub fn genre_name(&self) -> Option<&'static str> {
+        if self.category == 1 && (self.genre as usize) < consts::GENRE_NAMES.len() {
+            Some(consts::GENRE_NAMES[self.genre as usize])
+        } else {
+            None
+        }
     }
 }
 
@@ -231,10 +246,10 @@ impl From<u8> for TrackTextType {
 /// Track time information for start time or duration
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrackTime {
-    pub minutes: u8,  // Minutes, 1 byte, Uint8, values 0..255
-    pub seconds: u8,  // Seconds, 1 byte, Uint8, values 0..59
-    pub frames: u8,   // Frames, 1 byte, Uint8, values 0..74
-    pub flags: u8,    // Track_Flags, 1 byte; b7=ILP, b4-b1=TMF4-TMF1, b6,b5,b0 reserved
+    pub minutes: u8, // Minutes, 1 byte, Uint8, values 0..255
+    pub seconds: u8, // Seconds, 1 byte, Uint8, values 0..59
+    pub frames: u8,  // Frames, 1 byte, Uint8, values 0..74
+    pub flags: u8,   // Track_Flags, 1 byte; b7=ILP, b4-b1=TMF4-TMF1, b6,b5,b0 reserved
 }
 
 impl TrackTime {
@@ -252,9 +267,9 @@ impl TrackTime {
 /// Format: ISRC_Code[tno], 12 bytes, String
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Isrc {
-    pub country_code: [u8; 2],     // Country_Code, 2 bytes, String; ISO-3166-1 alpha-2 (e.g., "GB")
-    pub owner_code: [u8; 3],       // Owner_Code, 3 bytes, String; alphanumeric (e.g., "AAA")
-    pub recording_year: [u8; 2],   // Year_of_Recording, 2 bytes, String; last 2 digits of year (e.g., "94")
+    pub country_code: [u8; 2], // Country_Code, 2 bytes, String; ISO-3166-1 alpha-2 (e.g., "GB")
+    pub owner_code: [u8; 3],   // Owner_Code, 3 bytes, String; alphanumeric (e.g., "AAA")
+    pub recording_year: [u8; 2], // Year_of_Recording, 2 bytes, String; last 2 digits of year (e.g., "94")
     pub designation_code: [u8; 5], // Designation_Code, 5 bytes, String; numeric (e.g., "00468")
 }
 
@@ -491,7 +506,7 @@ impl MasterToc {
 
     /// Validate that this is a valid Master TOC
     pub fn is_valid(&self) -> bool {
-        &self.id == b"SACDMTOC"
+        &self.id == consts::MASTER_TOC_SIGNATURE
     }
 
     /// Get ID as string
@@ -537,6 +552,22 @@ impl MasterToc {
         } else {
             None
         }
+    }
+
+    /// Get disc category (from first genre table entry with category=1)
+    pub fn disc_category(&self) -> Option<&'static str> {
+        self.disc_genre
+            .iter()
+            .find(|g| g.category == 1)
+            .and_then(|g| g.category_name())
+    }
+
+    /// Get disc genre (from first genre table entry with category=1)
+    pub fn disc_genre(&self) -> Option<&'static str> {
+        self.disc_genre
+            .iter()
+            .find(|g| g.category == 1)
+            .and_then(|g| g.genre_name())
     }
 }
 
@@ -607,6 +638,14 @@ pub struct AreaToc {
     pub area_description_phonetic_offset: u16,
     /// Area_Copyright_Phonetic_Ptr
     pub copyright_phonetic_offset: u16,
+    /// Area_Description (parsed string)
+    pub area_description: Option<String>,
+    /// Area_Copyright (parsed string)
+    pub copyright: Option<String>,
+    /// Area_Description_Phonetic (parsed string)
+    pub area_description_phonetic: Option<String>,
+    /// Area_Copyright_Phonetic (parsed string)
+    pub copyright_phonetic: Option<String>,
     /// Area_Text
     pub track_texts: Vec<TrackText>,
 
@@ -754,6 +793,37 @@ impl AreaToc {
             Self::parse_track_times(area_data, size, track_count)?;
         let track_isrc = Self::parse_track_isrc(area_data, size, track_count)?;
 
+        // Parse area description and copyright strings
+        let area_description = if area_description_offset > 0
+            && (area_description_offset as usize) < area_data.len()
+        {
+            Self::read_text_at_offset(area_data, area_description_offset as usize)
+        } else {
+            None
+        };
+
+        let copyright = if copyright_offset > 0 && (copyright_offset as usize) < area_data.len() {
+            Self::read_text_at_offset(area_data, copyright_offset as usize)
+        } else {
+            None
+        };
+
+        let area_description_phonetic = if area_description_phonetic_offset > 0
+            && (area_description_phonetic_offset as usize) < area_data.len()
+        {
+            Self::read_text_at_offset(area_data, area_description_phonetic_offset as usize)
+        } else {
+            None
+        };
+
+        let copyright_phonetic = if copyright_phonetic_offset > 0
+            && (copyright_phonetic_offset as usize) < area_data.len()
+        {
+            Self::read_text_at_offset(area_data, copyright_phonetic_offset as usize)
+        } else {
+            None
+        };
+
         Ok(AreaToc {
             id,
             version,
@@ -781,6 +851,10 @@ impl AreaToc {
             copyright_offset,
             area_description_phonetic_offset,
             copyright_phonetic_offset,
+            area_description,
+            copyright,
+            area_description_phonetic,
+            copyright_phonetic,
             track_texts,
             track_times_start,
             track_times_duration,
@@ -793,21 +867,48 @@ impl AreaToc {
         std::str::from_utf8(&self.id).map(|s| s.to_string())
     }
 
-    /// Check if this is a 2-channel area
+    /// Check if this is a 2-channel area (Scarlet Book definition)
+    /// A 2-channel area has N_Channels=2 and Loudspeaker_Config=0
     pub fn is_two_channel(&self) -> bool {
-        &self.id == consts::AREA_TOC_SIGNATURE_STEREO
-            && self.channel_count == 2
-            && self.loudspeaker_config == 0
+        self.channel_count == 2 && self.loudspeaker_config == 0
     }
 
-    /// Check if this is a multi-channel area
+    /// Check if this is a multi-channel area (Scarlet Book definition)
+    /// Per the Scarlet Book spec and reference implementation, a multi-channel area
+    /// is any area that is not a 2-channel area (i.e., not N_Channels=2 with Loudspeaker_Config=0)
     pub fn is_multi_channel(&self) -> bool {
-        &self.id == consts::AREA_TOC_SIGNATURE_MCH
+        !(self.channel_count == 2 && self.loudspeaker_config == 0)
     }
 
     /// Parse track text from the raw area data
     ///
     /// This parses the "SACDTTxt" section which contains metadata for each track.
+    ///
+    /// # Arguments
+    /// Read null-terminated text at given offset in area data
+    ///
+    /// # Arguments
+    /// * `area_data` - Complete area data buffer
+    /// * `offset` - Byte offset to the text
+    ///
+    /// # Returns
+    /// Parsed UTF-8 string, or None if invalid
+    fn read_text_at_offset(area_data: &[u8], offset: usize) -> Option<String> {
+        if offset >= area_data.len() {
+            return None;
+        }
+
+        // Find null terminator
+        let end = area_data[offset..]
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(area_data.len() - offset);
+
+        // Convert to UTF-8 string
+        String::from_utf8(area_data[offset..offset + end].to_vec()).ok()
+    }
+
+    /// Parse track text
     ///
     /// # Arguments
     /// * `area_data` - Complete area data (multiple sectors, starting from Area TOC)
@@ -1009,11 +1110,7 @@ impl AreaToc {
     ///
     /// # Returns
     /// Vector of ISRC_Code[] (one per track)
-    fn parse_track_isrc(
-        area_data: &[u8],
-        size: u16,
-        track_count: u8,
-    ) -> Result<Vec<Isrc>> {
+    fn parse_track_isrc(area_data: &[u8], size: u16, track_count: u8) -> Result<Vec<Isrc>> {
         // Search for SACD_IGL signature
         let mut offset = consts::SACD_LSN_SIZE; // Skip first sector (Area TOC header)
         let end_offset = (size as usize) * consts::SACD_LSN_SIZE;

@@ -1,8 +1,5 @@
-use std::net::IpAddr;
-
 mod sacd_net_reader;
 mod scarletbook;
-use std::path::Path;
 
 pub mod sacd_ripper {
     include!(concat!(env!("OUT_DIR"), "/libsacd.sacd_ripper.rs"));
@@ -10,8 +7,9 @@ pub mod sacd_ripper {
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
     use indicatif::{ProgressBar, ProgressStyle};
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::path::Path;
 
     use super::*;
 
@@ -72,7 +70,7 @@ mod tests {
             ProgressStyle::default_bar()
                 .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} sectors ({percent}%)")
                 .unwrap()
-                .progress_chars("#>-")
+                .progress_chars("#>-"),
         );
 
         handle
