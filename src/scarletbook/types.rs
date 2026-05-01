@@ -15,7 +15,15 @@ pub enum FrameFormat {
     Dsd3In14 = 2,
     /// Fixed format. 2-Channel Stereo, Plain DSD, 3 Frames in 16 Sectors
     Dsd3In16 = 3,
-    /// Reserved for future use (4..15)
+    /// Undocumented format 4 (appears on some discs, similar to DSD)
+    Dsd4 = 4,
+    /// Undocumented format 5 (appears on some discs, similar to DSD)
+    Dsd5 = 5,
+    /// Undocumented format 6 (appears on some discs, similar to DSD)
+    Dsd6 = 6,
+    /// Undocumented format 7 (appears on some discs, similar to DSD)
+    Dsd7 = 7,
+    /// Reserved for future use (8..15)
     Unknown(u8),
 }
 
@@ -26,7 +34,41 @@ impl From<u8> for FrameFormat {
             1 => FrameFormat::Reserved,
             2 => FrameFormat::Dsd3In14,
             3 => FrameFormat::Dsd3In16,
+            4 => FrameFormat::Dsd4,
+            5 => FrameFormat::Dsd5,
+            6 => FrameFormat::Dsd6,
+            7 => FrameFormat::Dsd7,
             n => FrameFormat::Unknown(n),
+        }
+    }
+}
+
+impl FrameFormat {
+    /// Check if this is a DSD (uncompressed) format
+    pub fn is_dsd(&self) -> bool {
+        matches!(
+            self,
+            FrameFormat::Dsd3In14
+                | FrameFormat::Dsd3In16
+                | FrameFormat::Dsd4
+                | FrameFormat::Dsd5
+                | FrameFormat::Dsd6
+                | FrameFormat::Dsd7
+        )
+    }
+
+    /// Get the number of sectors per frame (for calculating track boundaries)
+    /// Returns None if unknown or not applicable
+    pub fn sectors_per_frame(&self) -> Option<u32> {
+        match self {
+            FrameFormat::Dst => Some(14), // DST uses similar frame structure as DSD
+            FrameFormat::Dsd3In14 => Some(14),
+            FrameFormat::Dsd3In16 => Some(16),
+            // For undocumented formats, we'll try 14 as a reasonable default
+            FrameFormat::Dsd4 | FrameFormat::Dsd5 | FrameFormat::Dsd6 | FrameFormat::Dsd7 => {
+                Some(14)
+            }
+            _ => None,
         }
     }
 }

@@ -1,0 +1,3 @@
+channels=2
+sample_rate=2822400
+frames=256

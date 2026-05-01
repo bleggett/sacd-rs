@@ -55,12 +55,33 @@ enum Commands {
         output: PathBuf,
 
         /// Extract 2-channel tracks
-        #[arg(long, default_value_t = true)]
+        #[arg(long)]
         stereo: bool,
 
         /// Extract multi-channel tracks
-        #[arg(long, default_value_t = true)]
+        #[arg(long)]
         multi_channel: bool,
+
+        /// Select specific tracks to extract (e.g., "1,2,5" or "1-3,5")
+        #[arg(short, long)]
+        tracks: Option<String>,
+    },
+    /// Extract DSF files directly from a network SACD server (no ISO needed)
+    ExtractNet {
+        /// Server address in format IP:PORT (e.g., 192.168.1.130:2002)
+        #[arg(short, long)]
+        server: String,
+
+        /// Output directory for extracted DSF files
+        output: PathBuf,
+
+        /// Extract 2-channel tracks
+        #[arg(long)]
+        stereo: bool,
+
+        /// Extract multi-channel tracks
+        #[arg(long)]
+        multichannel: bool,
 
         /// Select specific tracks to extract (e.g., "1,2,5" or "1-3,5")
         #[arg(short, long)]
@@ -221,9 +242,17 @@ fn main() -> Result<()> {
                 anyhow::bail!("ISO file not found: {}", iso.display());
             }
 
-            // Default to stereo if neither is specified
-            let extract_stereo = stereo || !multi_channel;
-            let extract_mch = multi_channel;
+            // If neither flag is specified, extract both
+            let extract_stereo = if !stereo && !multi_channel {
+                true // Default: extract both
+            } else {
+                stereo
+            };
+            let extract_mch = if !stereo && !multi_channel {
+                true // Default: extract both
+            } else {
+                multi_channel
+            };
 
             println!("Opening SACD ISO: {}", iso.display());
             let iso_reader = IsoReader::open(&iso).context("Failed to open ISO file")?;
@@ -235,7 +264,116 @@ fn main() -> Result<()> {
             // Print disc info
             sb_reader.print_disc_info();
 
-            println!("\n--- Extraction Plan ---");
+            // Parse track selection
+            let selected_tracks = if let Some(track_str) = tracks {
+                parse_track_selection(&track_str)?
+            } else {
+                Vec::new() // Empty means all tracks
+            };
+
+            // Create output directory if it doesn't exist
+            if !output.exists() {
+                fs::create_dir_all(&output).context("Failed to create output directory")?;
+            }
+
+            // Build disc prefix for filenames
+            let disc_title = sb_reader
+                .get_master_text()
+                .and_then(|mt| mt.disc_title.as_ref())
+                .map(|s| s.as_str());
+            let disc_artist = sb_reader
+                .get_master_text()
+                .and_then(|mt| mt.disc_artist.as_ref())
+                .map(|s| s.as_str());
+            let disc_prefix = scarletbook::extractor::build_disc_prefix(disc_title, disc_artist);
+
+            println!("\n=== Starting Extraction ===");
+            println!("Output directory: {}", output.display());
+
+            // Get TOCs before consuming sb_reader
+            let stereo_toc = sb_reader.get_stereo_toc();
+            let mch_toc = sb_reader.get_mch_toc();
+            let master_toc = sb_reader.get_master_toc();
+            let master_text = sb_reader.get_master_text().cloned();
+
+            // Get reader from sb_reader and create extractor
+            let reader = sb_reader.into_reader();
+            let mut extractor = scarletbook::extractor::TrackExtractor::new(reader);
+
+            // Extract stereo tracks
+            if extract_stereo {
+                if let Some(stereo_toc) = stereo_toc {
+                    println!("\n--- Extracting Stereo Tracks ---");
+                    extractor
+                        .extract_tracks(
+                            &master_toc,
+                            master_text.as_ref(),
+                            &stereo_toc,
+                            &selected_tracks,
+                            &output,
+                            &format!("{}-stereo", disc_prefix),
+                        )
+                        .context("Failed to extract stereo tracks")?;
+                } else {
+                    println!("\nNo stereo tracks found on disc");
+                }
+            }
+
+            // Extract multi-channel tracks
+            if extract_mch {
+                if let Some(mch_toc) = mch_toc {
+                    println!("\n--- Extracting Multi-Channel Tracks ---");
+                    extractor
+                        .extract_tracks(
+                            &master_toc,
+                            master_text.as_ref(),
+                            &mch_toc,
+                            &selected_tracks,
+                            &output,
+                            &format!("{}-mch", disc_prefix),
+                        )
+                        .context("Failed to extract multi-channel tracks")?;
+                } else {
+                    println!("\nNo multi-channel tracks found on disc");
+                }
+            }
+
+            println!("\n=== Extraction Complete ===");
+
+            Ok(())
+        }
+        Commands::ExtractNet {
+            server,
+            output,
+            stereo,
+            multichannel: multi_channel,
+            tracks,
+        } => {
+            let (ip, port) = parse_server_address(&server)?;
+
+            // If neither flag is specified, extract both
+            let extract_stereo = if !stereo && !multi_channel {
+                true // Default: extract both
+            } else {
+                stereo
+            };
+            let extract_mch = if !stereo && !multi_channel {
+                true // Default: extract both
+            } else {
+                multi_channel
+            };
+
+            println!("Connecting to {}:{}...", ip, port);
+            let net_reader = NetReader::open_network_reader(ip, port)
+                .context("Failed to connect to SACD server")?;
+            println!("Connected!");
+
+            println!("Reading disc metadata...");
+            let mut sb_reader = scarletbook::reader::new(net_reader)
+                .context("Failed to read SACD metadata from network")?;
+
+            // Print disc info
+            sb_reader.print_disc_info();
 
             // Parse track selection
             let selected_tracks = if let Some(track_str) = tracks {
@@ -244,52 +382,74 @@ fn main() -> Result<()> {
                 Vec::new() // Empty means all tracks
             };
 
-            // Check what areas are available and what to extract
-            let master_toc = sb_reader.get_master_toc();
-
-            if extract_stereo {
-                if master_toc.has_two_channel() {
-                    println!("Will extract 2-channel tracks");
-                    if let Some(stereo_toc) = sb_reader.get_stereo_toc() {
-                        println!("  Found {} stereo tracks", stereo_toc.track_count);
-                        if selected_tracks.is_empty() {
-                            println!("  Extracting all tracks");
-                        } else {
-                            println!("  Extracting tracks: {:?}", selected_tracks);
-                        }
-                    }
-                } else {
-                    println!("Warning: No 2-channel tracks found on disc");
-                }
-            }
-
-            if extract_mch {
-                if master_toc.has_multi_channel() {
-                    println!("Will extract multi-channel tracks");
-                    if let Some(mch_toc) = sb_reader.get_mch_toc() {
-                        println!("  Found {} multi-channel tracks", mch_toc.track_count);
-                        if selected_tracks.is_empty() {
-                            println!("  Extracting all tracks");
-                        } else {
-                            println!("  Extracting tracks: {:?}", selected_tracks);
-                        }
-                    }
-                } else {
-                    println!("Warning: No multi-channel tracks found on disc");
-                }
-            }
-
-            println!("\nOutput directory: {}", output.display());
-
             // Create output directory if it doesn't exist
             if !output.exists() {
                 fs::create_dir_all(&output).context("Failed to create output directory")?;
             }
 
-            println!(
-                "\nNote: DSF extraction not yet implemented (Phase 1 complete - ISO reading works!)"
-            );
-            println!("Phase 2 will add DSF writing and audio frame extraction.");
+            // Build disc prefix for filenames
+            let disc_title = sb_reader
+                .get_master_text()
+                .and_then(|mt| mt.disc_title.as_ref())
+                .map(|s| s.as_str());
+            let disc_artist = sb_reader
+                .get_master_text()
+                .and_then(|mt| mt.disc_artist.as_ref())
+                .map(|s| s.as_str());
+            let disc_prefix = scarletbook::extractor::build_disc_prefix(disc_title, disc_artist);
+
+            println!("\n=== Starting Extraction ===");
+            println!("Output directory: {}", output.display());
+
+            // Get TOCs before consuming sb_reader
+            let stereo_toc = sb_reader.get_stereo_toc();
+            let mch_toc = sb_reader.get_mch_toc();
+            let master_toc = sb_reader.get_master_toc();
+            let master_text = sb_reader.get_master_text().cloned();
+
+            // Get reader from sb_reader and create extractor
+            let reader = sb_reader.into_reader();
+            let mut extractor = scarletbook::extractor::TrackExtractor::new(reader);
+
+            // Extract stereo tracks
+            if extract_stereo {
+                if let Some(stereo_toc) = stereo_toc {
+                    println!("\n--- Extracting Stereo Tracks ---");
+                    extractor
+                        .extract_tracks(
+                            &master_toc,
+                            master_text.as_ref(),
+                            &stereo_toc,
+                            &selected_tracks,
+                            &output,
+                            &format!("{}-stereo", disc_prefix),
+                        )
+                        .context("Failed to extract stereo tracks")?;
+                } else {
+                    println!("\nNo stereo tracks found on disc");
+                }
+            }
+
+            // Extract multi-channel tracks
+            if extract_mch {
+                if let Some(mch_toc) = mch_toc {
+                    println!("\n--- Extracting Multi-Channel Tracks ---");
+                    extractor
+                        .extract_tracks(
+                            &master_toc,
+                            master_text.as_ref(),
+                            &mch_toc,
+                            &selected_tracks,
+                            &output,
+                            &format!("{}-mch", disc_prefix),
+                        )
+                        .context("Failed to extract multi-channel tracks")?;
+                } else {
+                    println!("\nNo multi-channel tracks found on disc");
+                }
+            }
+
+            println!("\n=== Extraction Complete ===");
 
             Ok(())
         }

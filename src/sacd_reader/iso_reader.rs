@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use log::debug;
 
 use crate::scarletbook::consts::SACD_LSN_SIZE;
 
@@ -82,6 +83,11 @@ impl IsoReader {
                 sector_count, start_lsn
             )
         })?;
+
+        // Log first few sectors in the 584-600 range
+        if start_lsn >= 584 && start_lsn < 590 {
+            debug!("[ISO_READ] LSN {}: First 32 bytes: {:02x?}", start_lsn, &buffer[..32.min(buffer.len())]);
+        }
 
         Ok(buffer)
     }

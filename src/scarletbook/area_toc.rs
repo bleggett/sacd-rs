@@ -1,6 +1,7 @@
 use crate::scarletbook::consts;
 use crate::scarletbook::types;
 use anyhow::Result;
+use log::warn;
 use byteorder::{BigEndian, ReadBytesExt};
 use std::io::{Cursor, Read};
 
@@ -91,6 +92,14 @@ pub struct AreaToc {
     // ===== Area_ISRC_Genre (from ISRC_and_Genre_List / SACD_IGL) =====
     /// ISRC_Code[tno], Vec of isrc_t, one per track; International Standard Recording Code
     pub track_isrc: Vec<types::Isrc>,
+    /// Track_Genre[tno], one per track (from SACD_IGL block, after ISRCs).
+    pub track_genres: Vec<types::GenreTable>,
+
+    // ===== Area_Tracklist_Offset (from Track_List_1 / SACDTRL1) =====
+    /// Per-track start LSN. One entry per track.
+    pub track_start_lsns: Vec<u32>,
+    /// Per-track length in LSNs. One entry per track.
+    pub track_length_lsns: Vec<u32>,
 }
 
 impl AreaToc {
@@ -224,7 +233,8 @@ impl AreaToc {
         // Parse track times and ISRC from complete area data
         let (track_times_start, track_times_duration) =
             Self::parse_track_times(area_data, size, track_count)?;
-        let track_isrc = Self::parse_track_isrc(area_data, size, track_count)?;
+        let (track_isrc, track_genres) = Self::parse_track_isrc_and_genres(area_data, size, track_count)?;
+        let (track_start_lsns, track_length_lsns) = Self::parse_track_offsets(area_data, size, track_count)?;
 
         // Parse area description and copyright strings
         let area_description = if area_description_offset > 0
@@ -292,6 +302,9 @@ impl AreaToc {
             track_times_start,
             track_times_duration,
             track_isrc,
+            track_genres,
+            track_start_lsns,
+            track_length_lsns,
         })
     }
 
@@ -431,7 +444,7 @@ impl AreaToc {
                 ptr += 1;
 
                 if padding1 != 0x20 {
-                    eprintln!("Warning: Padding1 is not 0x20 (got 0x{:02x})", padding1);
+                    warn!("Warning: Padding1 is not 0x20 (got 0x{:02x})", padding1);
                 }
 
                 // Read null-terminated string
@@ -543,23 +556,21 @@ impl AreaToc {
     ///
     /// # Returns
     /// Vector of ISRC_Code[] (one per track)
-    fn parse_track_isrc(area_data: &[u8], size: u16, track_count: u8) -> Result<Vec<types::Isrc>> {
+    fn parse_track_isrc_and_genres(
+        area_data: &[u8],
+        size: u16,
+        track_count: u8,
+    ) -> Result<(Vec<types::Isrc>, Vec<types::GenreTable>)> {
         // Search for SACD_IGL signature
         let mut offset = consts::SACD_LSN_SIZE; // Skip first sector (Area TOC header)
         let end_offset = (size as usize) * consts::SACD_LSN_SIZE;
 
         while offset + 8 <= end_offset {
             if &area_data[offset..offset + 8] == b"SACD_IGL" {
-                // Found ISRC and genre list
                 let mut reader = Cursor::new(&area_data[offset..]);
-
-                // Skip signature
                 reader.set_position(8);
 
                 let mut isrc_codes = Vec::with_capacity(track_count as usize);
-
-                // SACD_IGL structure has 255 fixed ISRC entries
-                // Read all 255 ISRC codes, but only keep track_count entries
                 for i in 0..255 {
                     let isrc = types::Isrc::parse(&mut reader)?;
                     if i < track_count {
@@ -567,12 +578,50 @@ impl AreaToc {
                     }
                 }
 
-                return Ok(isrc_codes);
+                let mut genres = Vec::with_capacity(track_count as usize);
+                for i in 0..255 {
+                    let g = types::GenreTable::parse(&mut reader)?;
+                    if i < track_count {
+                        genres.push(g);
+                    }
+                }
+
+                return Ok((isrc_codes, genres));
             }
             offset += consts::SACD_LSN_SIZE;
         }
+        Ok((vec![], vec![]))
+    }
 
-        // If not found, return empty vector
-        Ok(vec![])
+    /// Parse Track_List_1 (`SACDTRL1`) which holds explicit per-track LSN
+    /// ranges. Layout: 8-byte signature + 255 BE u32 `track_start_lsn` +
+    /// 255 BE u32 `track_length_lsn` (total 2048 bytes, one sector).
+    fn parse_track_offsets(
+        area_data: &[u8],
+        size: u16,
+        track_count: u8,
+    ) -> Result<(Vec<u32>, Vec<u32>)> {
+        let mut offset = consts::SACD_LSN_SIZE;
+        let end_offset = (size as usize) * consts::SACD_LSN_SIZE;
+        while offset + 8 <= end_offset {
+            if &area_data[offset..offset + 8] == b"SACDTRL1" {
+                let mut reader = Cursor::new(&area_data[offset..]);
+                reader.set_position(8);
+                let mut starts = Vec::with_capacity(track_count as usize);
+                for _ in 0..255 {
+                    starts.push(reader.read_u32::<BigEndian>()?);
+                }
+                starts.truncate(track_count as usize);
+                let mut lengths = Vec::with_capacity(track_count as usize);
+                for _ in 0..255 {
+                    lengths.push(reader.read_u32::<BigEndian>()?);
+                }
+                lengths.truncate(track_count as usize);
+                return Ok((starts, lengths));
+            }
+            offset += consts::SACD_LSN_SIZE;
+        }
+        warn!("SACDTRL1 not found in area TOC; falling back to estimated track ranges");
+        Ok((vec![], vec![]))
     }
 }

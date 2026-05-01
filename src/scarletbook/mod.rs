@@ -1,5 +1,10 @@
-mod area_toc;
+pub mod area_toc;
+pub mod audio;
 pub mod consts;
-mod master_toc;
+pub mod dsf;
+pub mod dst_decoder;
+pub mod extractor;
+pub mod id3;
+pub mod master_toc;
 pub mod reader;
 pub mod types;

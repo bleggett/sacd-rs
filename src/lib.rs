@@ -62,7 +62,7 @@ mod tests {
     fn test_dump_iso() {
         init();
         let mut handle =
-            sacd_net_reader::open_network_reader(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 130)), 2002)
+            sacd_reader::NetReader::open_network_reader(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 130)), 2002)
                 .expect("should init");
 
         let pb = ProgressBar::new(0);

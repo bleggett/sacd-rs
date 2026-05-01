@@ -9,6 +9,7 @@ use crate::scarletbook::{
     area_toc::AreaToc,
     consts,
     master_toc::{MasterText, MasterToc},
+    types,
 };
 
 pub struct ScarletBookReader<R: SacdReader> {
@@ -59,6 +60,11 @@ impl<R: SacdReader> ScarletBookReader<R> {
 
     pub fn get_reader_mut(&mut self) -> &mut R {
         &mut self.reader
+    }
+
+    /// Consume the ScarletBookReader and return the inner reader
+    pub fn into_reader(self) -> R {
+        self.reader
     }
 
     /// Print disc and track information to stdout
@@ -233,7 +239,7 @@ impl<R: SacdReader> ScarletBookReader<R> {
             area_count += 1;
         }
         writeln!(writer)?;
-        writeln!(writer, "Area count: {}", area_count)?;
+        writeln!(writer, "Area Count: {}", area_count)?;
         Ok(())
     }
 
@@ -264,18 +270,37 @@ impl<R: SacdReader> ScarletBookReader<R> {
         writeln!(writer, "    Track Count: {}", area_toc.track_count)?;
         writeln!(
             writer,
-            "    Total play time: {:02}:{:02}:{:02} [mins:secs:frames]",
+            "    Total Play Time: {:02}:{:02}:{:02} [mins:secs:frames]",
             area_toc.total_playtime.minutes,
             area_toc.total_playtime.seconds,
             area_toc.total_playtime.frames
         )?;
         writeln!(
             writer,
-            "    Speaker config: {} Channel",
+            "    Speaker Config: {} Channel",
             area_toc.channel_count
         )?;
 
-        writeln!(writer, "    Track list [{}]:", area_idx)?;
+        // Print frame format (DST or DSD)
+        let format_str = match area_toc.frame_format {
+            types::FrameFormat::Dst => "DST (compressed)",
+            types::FrameFormat::Dsd3In14 => "DSD 3-in-14 (uncompressed)",
+            types::FrameFormat::Dsd3In16 => "DSD 3-in-16 (uncompressed)",
+            types::FrameFormat::Dsd4 => "DSD format 4 (uncompressed)",
+            types::FrameFormat::Dsd5 => "DSD format 5 (uncompressed)",
+            types::FrameFormat::Dsd6 => "DSD format 6 (uncompressed)",
+            types::FrameFormat::Dsd7 => "DSD format 7 (uncompressed)",
+            types::FrameFormat::Reserved => "Reserved",
+            types::FrameFormat::Unknown(val) => {
+                writeln!(writer, "    Frame Format: Unknown ({})", val)?;
+                ""
+            }
+        };
+        if !format_str.is_empty() {
+            writeln!(writer, "    Frame Format: {}", format_str)?;
+        }
+
+        writeln!(writer, "    Track List [{}]:", area_idx)?;
         for (i, track_text) in area_toc.track_texts.iter().enumerate() {
             if let Some(ref title) = track_text.title {
                 writeln!(writer, "        Title[{}]: {}", i, title)?;
