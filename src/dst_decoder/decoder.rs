@@ -414,6 +414,10 @@ pub struct DstDecoder {
     /// Ptable4Bit[ChNr][BitNr], filled per-frame.
     ptable4_bit: Vec<Vec<u8>>,
     channel_count: usize,
+    /// Whether the current CPU advertises AVX2; cached at construction so
+    /// the per-bit FIR dispatch is one predicted branch instead of a
+    /// `cpuid` call.
+    has_avx2: bool,
 }
 
 impl DstDecoder {
@@ -455,6 +459,10 @@ impl DstDecoder {
             filter4_bit: vec![vec![0u8; nr_of_bits_per_ch as usize]; MAX_CHANNELS],
             ptable4_bit: vec![vec![0u8; nr_of_bits_per_ch as usize]; MAX_CHANNELS],
             channel_count,
+            #[cfg(target_arch = "x86_64")]
+            has_avx2: std::is_x86_feature_detected!("avx2"),
+            #[cfg(not(target_arch = "x86_64"))]
+            has_avx2: false,
         })
     }
 
@@ -1083,6 +1091,7 @@ impl DstDecoder {
         let a_data_len: i32 = self.a_data_len;
         let filter4_bit = &self.filter4_bit[..];
         let ptable4_bit = &self.ptable4_bit[..];
+        let has_avx2 = self.has_avx2;
 
         for bit_nr in 0..nr_of_bits_per_ch {
             let byte_nr = bit_nr / 8;
@@ -1092,30 +1101,30 @@ impl DstDecoder {
                 let ftable = &i_coef_i[filter_idx];
                 let st = &mut status[ch_nr];
 
-                // FIR filter (LT_RUN_FILTER_I): treat each 4-byte u32 as four
-                // status bytes (little-endian: byte i lives in st[i>>2] at
-                // (i&3)*8). The compiler easily folds these shifts into byte
-                // loads on x86.
-                let w0 = st[0];
-                let w1 = st[1];
-                let w2 = st[2];
-                let w3 = st[3];
-                let predict: i16 = ftable[0][(w0 & 0xff) as usize]
-                    .wrapping_add(ftable[1][((w0 >> 8) & 0xff) as usize])
-                    .wrapping_add(ftable[2][((w0 >> 16) & 0xff) as usize])
-                    .wrapping_add(ftable[3][((w0 >> 24) & 0xff) as usize])
-                    .wrapping_add(ftable[4][(w1 & 0xff) as usize])
-                    .wrapping_add(ftable[5][((w1 >> 8) & 0xff) as usize])
-                    .wrapping_add(ftable[6][((w1 >> 16) & 0xff) as usize])
-                    .wrapping_add(ftable[7][((w1 >> 24) & 0xff) as usize])
-                    .wrapping_add(ftable[8][(w2 & 0xff) as usize])
-                    .wrapping_add(ftable[9][((w2 >> 8) & 0xff) as usize])
-                    .wrapping_add(ftable[10][((w2 >> 16) & 0xff) as usize])
-                    .wrapping_add(ftable[11][((w2 >> 24) & 0xff) as usize])
-                    .wrapping_add(ftable[12][(w3 & 0xff) as usize])
-                    .wrapping_add(ftable[13][((w3 >> 8) & 0xff) as usize])
-                    .wrapping_add(ftable[14][((w3 >> 16) & 0xff) as usize])
-                    .wrapping_add(ftable[15][((w3 >> 24) & 0xff) as usize]);
+                // FIR filter (LT_RUN_FILTER_I). Each `st[i]` u32 packs four
+                // status bytes (little-endian: byte j lives at
+                // `(j & 3) * 8`). The implementations gather 16 i16 lookups
+                // (one per status byte × table 0..15) and accumulate with
+                // wrapping i16 add — bit-identical to the chained scalar
+                // form across all paths.
+                let predict: i16 = {
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        if has_avx2 {
+                            // SAFETY: `has_avx2` was set from
+                            // `is_x86_feature_detected!("avx2")` at
+                            // construction; AVX2 is available on this CPU.
+                            unsafe { fir_predict_avx2(ftable, st) }
+                        } else {
+                            // SSE2 is baseline on every x86_64 target.
+                            fir_predict_sse2(ftable, st)
+                        }
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        fir_predict_scalar(ftable, st)
+                    }
+                };
 
                 // Decode residual.
                 let residual = if half_prob[ch_nr] != 0 && (bit_nr as i32) < nr_of_half_bits[ch_nr]
@@ -1133,7 +1142,10 @@ impl DstDecoder {
                 dsd_data[byte_nr * nr_of_channels + ch_nr] |= (bit_val as u8) << bit_shift;
 
                 // Filter status update — 32-bit shift-with-carry, four words.
-                st[3] = (w3 << 1) | (w2 >> 31);
+                let w0 = st[0];
+                let w1 = st[1];
+                let w2 = st[2];
+                st[3] = (st[3] << 1) | (w2 >> 31);
                 st[2] = (w2 << 1) | (w1 >> 31);
                 st[1] = (w1 << 1) | (w0 >> 31);
                 st[0] = (w0 << 1) | bit_val as u32;
@@ -1146,6 +1158,122 @@ impl DstDecoder {
         }
         Ok(total_bytes)
     }
+}
+
+// ============================================================================
+// FIR predict — three implementations selected at runtime.
+//
+// Each consumes the channel's 16-byte filter status (packed into a `[u32; 4]`
+// little-endian) and returns the wrapping i16 sum
+// `Σ ftable[t][status_byte_t]` for t in 0..16. The status byte at position
+// `t` lives in `st[t >> 2]` at bit offset `(t & 3) * 8`.
+//
+// SSE2 and AVX2 paths use `_mm_add_epi16` / `_mm256_add_epi16`, which are
+// per-lane modular i16 addition — bit-identical to chained `i16::wrapping_add`.
+// ============================================================================
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+fn fir_predict_scalar(ftable: &[[i16; 256]; 16], st: &[u32; 4]) -> i16 {
+    let w0 = st[0];
+    let w1 = st[1];
+    let w2 = st[2];
+    let w3 = st[3];
+    ftable[0][(w0 & 0xff) as usize]
+        .wrapping_add(ftable[1][((w0 >> 8) & 0xff) as usize])
+        .wrapping_add(ftable[2][((w0 >> 16) & 0xff) as usize])
+        .wrapping_add(ftable[3][((w0 >> 24) & 0xff) as usize])
+        .wrapping_add(ftable[4][(w1 & 0xff) as usize])
+        .wrapping_add(ftable[5][((w1 >> 8) & 0xff) as usize])
+        .wrapping_add(ftable[6][((w1 >> 16) & 0xff) as usize])
+        .wrapping_add(ftable[7][((w1 >> 24) & 0xff) as usize])
+        .wrapping_add(ftable[8][(w2 & 0xff) as usize])
+        .wrapping_add(ftable[9][((w2 >> 8) & 0xff) as usize])
+        .wrapping_add(ftable[10][((w2 >> 16) & 0xff) as usize])
+        .wrapping_add(ftable[11][((w2 >> 24) & 0xff) as usize])
+        .wrapping_add(ftable[12][(w3 & 0xff) as usize])
+        .wrapping_add(ftable[13][((w3 >> 8) & 0xff) as usize])
+        .wrapping_add(ftable[14][((w3 >> 16) & 0xff) as usize])
+        .wrapping_add(ftable[15][((w3 >> 24) & 0xff) as usize])
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn fir_predict_sse2(ftable: &[[i16; 256]; 16], st: &[u32; 4]) -> i16 {
+    use std::arch::x86_64::*;
+    // SAFETY: every x86_64 baseline target has SSE2.
+    unsafe {
+        let w0 = st[0];
+        let w1 = st[1];
+        let w2 = st[2];
+        let w3 = st[3];
+        // Two 8×i16 vectors of lookups.
+        let v0 = _mm_set_epi16(
+            ftable[7][((w1 >> 24) & 0xff) as usize],
+            ftable[6][((w1 >> 16) & 0xff) as usize],
+            ftable[5][((w1 >> 8) & 0xff) as usize],
+            ftable[4][(w1 & 0xff) as usize],
+            ftable[3][((w0 >> 24) & 0xff) as usize],
+            ftable[2][((w0 >> 16) & 0xff) as usize],
+            ftable[1][((w0 >> 8) & 0xff) as usize],
+            ftable[0][(w0 & 0xff) as usize],
+        );
+        let v1 = _mm_set_epi16(
+            ftable[15][((w3 >> 24) & 0xff) as usize],
+            ftable[14][((w3 >> 16) & 0xff) as usize],
+            ftable[13][((w3 >> 8) & 0xff) as usize],
+            ftable[12][(w3 & 0xff) as usize],
+            ftable[11][((w2 >> 24) & 0xff) as usize],
+            ftable[10][((w2 >> 16) & 0xff) as usize],
+            ftable[9][((w2 >> 8) & 0xff) as usize],
+            ftable[8][(w2 & 0xff) as usize],
+        );
+        // Pairwise → 8 lanes, then horizontal-reduce 8 → 1.
+        let s = _mm_add_epi16(v0, v1);
+        let s = _mm_add_epi16(s, _mm_srli_si128(s, 8));
+        let s = _mm_add_epi16(s, _mm_srli_si128(s, 4));
+        let s = _mm_add_epi16(s, _mm_srli_si128(s, 2));
+        _mm_extract_epi16::<0>(s) as i16
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn fir_predict_avx2(ftable: &[[i16; 256]; 16], st: &[u32; 4]) -> i16 {
+    use std::arch::x86_64::*;
+    let w0 = st[0];
+    let w1 = st[1];
+    let w2 = st[2];
+    let w3 = st[3];
+    // All 16 lookups packed into one 256-bit vector.
+    let v = _mm256_set_epi16(
+        ftable[15][((w3 >> 24) & 0xff) as usize],
+        ftable[14][((w3 >> 16) & 0xff) as usize],
+        ftable[13][((w3 >> 8) & 0xff) as usize],
+        ftable[12][(w3 & 0xff) as usize],
+        ftable[11][((w2 >> 24) & 0xff) as usize],
+        ftable[10][((w2 >> 16) & 0xff) as usize],
+        ftable[9][((w2 >> 8) & 0xff) as usize],
+        ftable[8][(w2 & 0xff) as usize],
+        ftable[7][((w1 >> 24) & 0xff) as usize],
+        ftable[6][((w1 >> 16) & 0xff) as usize],
+        ftable[5][((w1 >> 8) & 0xff) as usize],
+        ftable[4][(w1 & 0xff) as usize],
+        ftable[3][((w0 >> 24) & 0xff) as usize],
+        ftable[2][((w0 >> 16) & 0xff) as usize],
+        ftable[1][((w0 >> 8) & 0xff) as usize],
+        ftable[0][(w0 & 0xff) as usize],
+    );
+    // Fold 16 → 8 i16 lanes (pairwise add of high and low halves), then
+    // horizontal-reduce 8 → 1 with SSE2 shuffles.
+    let lo = _mm256_castsi256_si128(v);
+    let hi = _mm256_extracti128_si256::<1>(v);
+    let s = _mm_add_epi16(lo, hi);
+    let s = _mm_add_epi16(s, _mm_srli_si128(s, 8));
+    let s = _mm_add_epi16(s, _mm_srli_si128(s, 4));
+    let s = _mm_add_epi16(s, _mm_srli_si128(s, 2));
+    _mm_extract_epi16::<0>(s) as i16
 }
 
 // ============================================================================
