@@ -103,7 +103,7 @@ pub fn render_id3(
         .and_then(|t| {
             t.title
                 .as_deref()
-                .or_else(|| t.title_phonetic.as_deref())
+                .or(t.title_phonetic.as_deref())
         })
         .map(|s| s.to_string())
         .unwrap_or_else(|| "no track title".to_string());
@@ -121,11 +121,10 @@ pub fn render_id3(
     // disc_title is present (no album_title), it's used as TALB.
     let disc_title = master_text.and_then(|m| m.disc_title.as_deref());
     match (album_title, disc_title) {
-        (Some(at), Some(dt)) => {
-            if dt != at || master_toc.album_set_size > 1 {
+        (Some(at), Some(dt))
+            if (dt != at || master_toc.album_set_size > 1) => {
                 add_txxx(&mut frames, "DISCSUBTITLE", dt);
             }
-        }
         (None, Some(dt)) => {
             add_text(&mut frames, b"TALB", dt);
         }
@@ -136,7 +135,7 @@ pub fn render_id3(
     let track_perf = track_text.and_then(|t| {
         t.performer
             .as_deref()
-            .or_else(|| t.performer_phonetic.as_deref())
+            .or(t.performer_phonetic.as_deref())
     });
     let artist_for_tpe1: Option<&str> = track_perf.or_else(|| {
         master_text.and_then(|m| {
@@ -164,7 +163,7 @@ pub fn render_id3(
     if let Some(c) = track_text.and_then(|t| {
         t.composer
             .as_deref()
-            .or_else(|| t.composer_phonetic.as_deref())
+            .or(t.composer_phonetic.as_deref())
     }) {
         add_text(&mut frames, b"TCOM", c);
     }
@@ -185,11 +184,11 @@ pub fn render_id3(
     }
 
     // TSRC — ISRC, concatenated as country+owner+year+designation (12 chars).
-    if let Some(isrc) = area_toc.track_isrc.get(track_idx) {
-        if isrc.country_code[0] != 0
+    if let Some(isrc) = area_toc.track_isrc.get(track_idx)
+        && (isrc.country_code[0] != 0
             || isrc.owner_code[0] != 0
             || isrc.recording_year[0] != 0
-            || isrc.designation_code[0] != 0
+            || isrc.designation_code[0] != 0)
         {
             let s = ascii_concat(&[
                 &isrc.country_code,
@@ -199,7 +198,6 @@ pub fn render_id3(
             ]);
             add_text(&mut frames, b"TSRC", &s);
         }
-    }
 
     // TPOS — disc number/disc count
     let tpos = format!(

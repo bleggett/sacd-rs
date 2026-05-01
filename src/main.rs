@@ -195,7 +195,7 @@ fn main() -> Result<()> {
             let pb = ProgressBar::new(0);
             pb.set_style(
                 ProgressStyle::default_bar()
-                    .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} sectors ({percent}%) {bytes}/{total_bytes} [{elapsed_precise}]")
+                    .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} frames ({percent}%) [{elapsed_precise}]")
                     .unwrap()
                     .progress_chars("#>-")
             );

@@ -872,7 +872,7 @@ impl DstDecoder {
                     } else {
                         r + (-x + 3) / 8
                     };
-                    if cv < -(1 << (SIZE_PREDCOEF - 1)) || cv >= (1 << (SIZE_PREDCOEF - 1)) {
+                    if !(-(1 << (SIZE_PREDCOEF - 1))..(1 << (SIZE_PREDCOEF - 1))).contains(&cv) {
                         bail!(DstError::InvalidCoefficientRange);
                     }
                     coefs[c] = cv as i16;
@@ -939,7 +939,7 @@ impl DstDecoder {
                         } else {
                             r + (-x + 3) / 8
                         };
-                        if cv < 1 || cv > (1 << (AC_BITS - 1)) {
+                        if !(1..=(1 << (AC_BITS - 1))).contains(&cv) {
                             bail!(DstError::InvalidPtableRange);
                         }
                         self.p_one[ptable_nr][entry] = cv;
@@ -1028,7 +1028,7 @@ impl DstDecoder {
         let nr_of_filters = self.frame_hdr.nr_of_filters as usize;
         let mut out = vec![[[0i16; 256]; 16]; nr_of_filters];
         for filter_nr in 0..nr_of_filters {
-            let filter_length = self.frame_hdr.pred_order[filter_nr] as i32;
+            let filter_length = self.frame_hdr.pred_order[filter_nr];
             let coefs = &self.frame_hdr.i_coef_a[filter_nr];
             for table_nr in 0..16 {
                 let mut k = filter_length - (table_nr as i32) * 8;

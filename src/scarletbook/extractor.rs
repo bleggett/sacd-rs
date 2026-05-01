@@ -58,14 +58,10 @@ impl<R: SacdReader> TrackExtractor<R> {
             .get(track_idx)
             .ok_or_else(|| anyhow::anyhow!("Track {} duration not found", track_number))?;
 
-        // Calculate start and end LSNs for the track
-        // SACD timing: 75 frames per second, each frame is 588 sectors
+        // Calculate start frame for the track. SACD timing is 75 frames/sec.
         let start_frame = track_start_time.minutes as u32 * 60 * 75
             + track_start_time.seconds as u32 * 75
             + track_start_time.frames as u32;
-        let duration_frames = track_duration.minutes as u32 * 60 * 75
-            + track_duration.seconds as u32 * 75
-            + track_duration.frames as u32;
 
         // Get sectors per frame
         let sectors_per_frame = area_toc
@@ -149,11 +145,7 @@ impl<R: SacdReader> TrackExtractor<R> {
         dsf_writer.set_id3_footer(id3);
 
         // Create audio sector parser
-        let mut audio_parser = AudioSectorParser::new(
-            area_toc.frame_format,
-            area_toc.channel_count as usize,
-            DSD64_SAMPLE_RATE as usize,
-        )?;
+        let mut audio_parser = AudioSectorParser::new(area_toc.frame_format)?;
 
         // Timecode filter — only frames whose timecode is in
         // [track_start, track_start + track_duration) are decoded. This
@@ -226,14 +218,13 @@ impl<R: SacdReader> TrackExtractor<R> {
                     for i in 0..want {
                         let off = (i as usize) * SECTOR;
                         let sector = &chunk[off..off + SECTOR];
-                        if let Some(raw) = audio_parser.parse_sector(sector)? {
-                            if tx.send(raw).is_err() {
+                        if let Some(raw) = audio_parser.parse_sector(sector)?
+                            && tx.send(raw).is_err() {
                                 // Consumer dropped (almost certainly due to
                                 // a write/decode error). Stop producing —
                                 // the consumer's error will be propagated.
                                 break 'outer;
                             }
-                        }
                     }
                     current_lsn += want;
                 }
@@ -249,6 +240,15 @@ impl<R: SacdReader> TrackExtractor<R> {
             // returns (including via `?`). Dropping `rx` unblocks any
             // producer waiting on a full channel after a consumer error.
             let consumer_pb = progress_bar.cloned();
+            // Per-track rayon worker pool. Building a dedicated pool here
+            // (instead of using rayon's global pool) means the worker
+            // threads — and therefore their `TLS_DECODER` slots — are
+            // created fresh for each track, which simplifies init.
+            let pool = rayon::ThreadPoolBuilder::new()
+                .thread_name(|i| format!("dst-decode-{}", i))
+                .build()
+                .map_err(|e| anyhow::anyhow!("rayon pool: {}", e))?;
+
             let consumer_res = (|rx: std::sync::mpsc::Receiver<Vec<u8>>| -> Result<()> {
                 thread_local! {
                     static TLS_DECODER: RefCell<Option<DstDecoder>> = const {
@@ -264,23 +264,27 @@ impl<R: SacdReader> TrackExtractor<R> {
                         }
                         let n = batch.len() as u64;
                         if is_dst {
-                            // Parallel decode of this batch.
-                            let decoded: Result<Vec<Vec<u8>>> = batch
-                                .par_iter()
-                                .map(|raw| -> Result<Vec<u8>> {
-                                    TLS_DECODER.with(|cell| -> Result<Vec<u8>> {
-                                        let mut slot = cell.borrow_mut();
-                                        if slot.is_none() {
-                                            *slot = Some(DstDecoder::new(channels, sample_rate)?);
-                                        }
-                                        let dec = slot.as_mut().unwrap();
-                                        let mut buf = vec![0u8; dec.dsd_frame_bytes()];
-                                        let n = dec.decode_frame(raw, &mut buf)?;
-                                        buf.truncate(n);
-                                        Ok(buf)
+                            // Parallel decode of this batch on the
+                            // per-track pool.
+                            let decoded: Result<Vec<Vec<u8>>> = pool.install(|| {
+                                batch
+                                    .par_iter()
+                                    .map(|raw| -> Result<Vec<u8>> {
+                                        TLS_DECODER.with(|cell| -> Result<Vec<u8>> {
+                                            let mut slot = cell.borrow_mut();
+                                            if slot.is_none() {
+                                                *slot =
+                                                    Some(DstDecoder::new(channels, sample_rate)?);
+                                            }
+                                            let dec = slot.as_mut().unwrap();
+                                            let mut buf = vec![0u8; dec.dsd_frame_bytes()];
+                                            let n = dec.decode_frame(raw, &mut buf)?;
+                                            buf.truncate(n);
+                                            Ok(buf)
+                                        })
                                     })
-                                })
-                                .collect();
+                                    .collect()
+                            });
                             for f in decoded? {
                                 dsf_writer.write_samples(&f)?;
                             }
@@ -388,7 +392,7 @@ impl<R: SacdReader> TrackExtractor<R> {
             let pb = ProgressBar::new(0);
             pb.set_style(
                 ProgressStyle::default_bar()
-                    .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} sectors ({percent}%) [{elapsed_precise}]")
+                    .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} frames ({percent}%) [{elapsed_precise}]")
                     .unwrap()
                     .progress_chars("#>-"),
             );

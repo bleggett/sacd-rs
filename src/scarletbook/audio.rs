@@ -127,15 +127,10 @@ pub struct AudioSectorParser {
 }
 
 impl AudioSectorParser {
-    /// Create a new audio sector parser. The `channel_count` and
-    /// `sample_rate` parameters are accepted for forward compatibility but
-    /// are not used: this parser only demuxes sectors into raw frame bytes
-    /// and never decodes.
-    pub fn new(
-        frame_format: FrameFormat,
-        _channel_count: usize,
-        _sample_rate: usize,
-    ) -> Result<Self> {
+    /// Create a new audio sector parser. The parser only demuxes sectors
+    /// into raw frame bytes and never decodes; channel count and sample
+    /// rate are properties of the downstream `DstDecoder`, not the parser.
+    pub fn new(frame_format: FrameFormat) -> Result<Self> {
         Ok(Self {
             frame_format,
             frame_buffer: Vec::new(),
@@ -565,7 +560,7 @@ mod tests {
 
         // Drive the parser. Use a wide filter so all three frames are accepted.
         let mut parser =
-            AudioSectorParser::new(FrameFormat::Dst, 2, 2_822_400).expect("parser create");
+            AudioSectorParser::new(FrameFormat::Dst).expect("parser create");
         parser.set_timecode_filter(0, 0, 0, 0, 0, 100); // [0, 100)
 
         let mut produced = 0usize;

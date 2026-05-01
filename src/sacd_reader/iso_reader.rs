@@ -85,7 +85,7 @@ impl IsoReader {
         })?;
 
         // Log first few sectors in the 584-600 range
-        if start_lsn >= 584 && start_lsn < 590 {
+        if (584..590).contains(&start_lsn) {
             debug!("[ISO_READ] LSN {}: First 32 bytes: {:02x?}", start_lsn, &buffer[..32.min(buffer.len())]);
         }
 
