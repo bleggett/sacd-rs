@@ -11,8 +11,8 @@ const DATA_CHUNK_ID: &[u8; 4] = b"data";
 const DSD_CHUNK_SIZE: u64 = 28;
 const FMT_CHUNK_SIZE: u64 = 52;
 
-/// Sample rate for DSD64 (2.8224 MHz)
-pub const DSD64_SAMPLE_RATE: u32 = 2822400;
+/// DSF block size per channel — 4096 bytes is fixed by the DSF spec.
+pub const DSF_BLOCK_SIZE_PER_CHANNEL: usize = 4096;
 
 /// DSF file writer for SACD audio extraction. Note that `sample_rate` and
 /// the up-front `total_samples_per_channel` parameters are written into
@@ -93,7 +93,7 @@ impl DsfWriter {
         writer.write_u32::<LittleEndian>(sample_rate)?; // Sampling frequency
         writer.write_u32::<LittleEndian>(1)?; // Bits per sample (always 1 for DSD)
         writer.write_u64::<LittleEndian>(total_samples_per_channel)?; // Sample count
-        writer.write_u32::<LittleEndian>(4096)?; // Block size per channel (always 4096)
+        writer.write_u32::<LittleEndian>(DSF_BLOCK_SIZE_PER_CHANNEL as u32)?;
         writer.write_u32::<LittleEndian>(0)?; // Reserved (must be 0)
 
         // Write data chunk header
@@ -101,8 +101,9 @@ impl DsfWriter {
         writer.write_all(DATA_CHUNK_ID)?;
         writer.write_u64::<LittleEndian>(0)?; // Data chunk size (placeholder, will update later)
 
-        // Initialize per-channel buffers (4096 bytes each)
-        let channel_buffers = vec![Vec::with_capacity(4096); channel_count as usize];
+        // Initialize per-channel buffers, one block-sized chunk each.
+        let channel_buffers =
+            vec![Vec::with_capacity(DSF_BLOCK_SIZE_PER_CHANNEL); channel_count as usize];
 
         Ok(Self {
             writer,
@@ -149,12 +150,12 @@ impl DsfWriter {
             self.channel_buffer_pos += 1;
 
             // Check if ALL channels' buffers are full (4096 bytes each)
-            if self.channel_buffers.iter().all(|buf| buf.len() >= 4096) {
+            if self.channel_buffers.iter().all(|buf| buf.len() >= DSF_BLOCK_SIZE_PER_CHANNEL) {
                 // Write all channel blocks in order: ch0, ch1, ch2, ...
                 for channel in 0..self.channel_count as usize {
-                    let block: Vec<u8> = self.channel_buffers[channel].drain(..4096).collect();
+                    let block: Vec<u8> = self.channel_buffers[channel].drain(..DSF_BLOCK_SIZE_PER_CHANNEL).collect();
                     self.writer.write_all(&block)?;
-                    self.bytes_written += 4096;
+                    self.bytes_written += DSF_BLOCK_SIZE_PER_CHANNEL as u64;
                 }
             }
         }
@@ -167,10 +168,10 @@ impl DsfWriter {
         // With the new round-robin approach, we flush individual channels as they fill
         // This function is kept for the finalize() method
         for channel in 0..self.channel_count as usize {
-            if self.channel_buffers[channel].len() >= 4096 {
-                let block: Vec<u8> = self.channel_buffers[channel].drain(..4096).collect();
+            if self.channel_buffers[channel].len() >= DSF_BLOCK_SIZE_PER_CHANNEL {
+                let block: Vec<u8> = self.channel_buffers[channel].drain(..DSF_BLOCK_SIZE_PER_CHANNEL).collect();
                 self.writer.write_all(&block)?;
-                self.bytes_written += 4096;
+                self.bytes_written += DSF_BLOCK_SIZE_PER_CHANNEL as u64;
             }
         }
         Ok(())
@@ -181,8 +182,8 @@ impl DsfWriter {
         // Flush any remaining partial blocks (pad with zeros if needed)
         if self.channel_buffers.iter().any(|buf| !buf.is_empty()) {
             for channel_buf in &mut self.channel_buffers {
-                if channel_buf.len() < 4096 {
-                    channel_buf.resize(4096, 0);
+                if channel_buf.len() < DSF_BLOCK_SIZE_PER_CHANNEL {
+                    channel_buf.resize(DSF_BLOCK_SIZE_PER_CHANNEL, 0);
                 }
             }
             self.flush_channel_block()?;

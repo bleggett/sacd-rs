@@ -2,7 +2,8 @@ use crate::dst_decoder::decoder::DstDecoder;
 use crate::sacd_reader::SacdReader;
 use crate::scarletbook::area_toc::AreaToc;
 use crate::scarletbook::audio::AudioSectorParser;
-use crate::scarletbook::dsf::{DSD64_SAMPLE_RATE, DsfWriter};
+use crate::scarletbook::consts::{DSD64_SAMPLE_RATE, FRAMES_PER_MINUTE, FRAMES_PER_SECOND};
+use crate::scarletbook::dsf::DsfWriter;
 use crate::scarletbook::id3::render_id3;
 use crate::scarletbook::master_toc::{MasterText, MasterToc};
 use crate::scarletbook::types::FrameFormat;
@@ -59,9 +60,9 @@ impl<R: SacdReader> TrackExtractor<R> {
             .get(track_idx)
             .ok_or_else(|| anyhow::anyhow!("Track {} duration not found", track_number))?;
 
-        // Calculate start frame for the track. SACD timing is 75 frames/sec.
-        let start_frame = track_start_time.minutes as u32 * 60 * 75
-            + track_start_time.seconds as u32 * 75
+        // Calculate start frame for the track.
+        let start_frame = track_start_time.minutes as u32 * FRAMES_PER_MINUTE
+            + track_start_time.seconds as u32 * FRAMES_PER_SECOND
             + track_start_time.frames as u32;
 
         // Get sectors per frame
@@ -90,8 +91,8 @@ impl<R: SacdReader> TrackExtractor<R> {
                         .track_times_start
                         .get(track_idx + 1)
                         .ok_or_else(|| anyhow::anyhow!("Next track start time not found"))?;
-                    let next_fc = next.minutes as u32 * 60 * 75
-                        + next.seconds as u32 * 75
+                    let next_fc = next.minutes as u32 * FRAMES_PER_MINUTE
+                        + next.seconds as u32 * FRAMES_PER_SECOND
                         + next.frames as u32;
                     area_toc.track_start + (next_fc * sectors_per_frame / 3)
                 } else {
@@ -123,18 +124,17 @@ impl<R: SacdReader> TrackExtractor<R> {
         // Total expected frames == track duration in 1/75-second frames
         // (already computed as `dur_fc` below).
         if let Some(pb) = progress_bar {
-            let total_frames = track_duration.minutes as u64 * 60 * 75
-                + track_duration.seconds as u64 * 75
+            let total_frames = track_duration.minutes as u64 * FRAMES_PER_MINUTE as u64
+                + track_duration.seconds as u64 * FRAMES_PER_SECOND as u64
                 + track_duration.frames as u64;
             pb.set_length(total_frames);
             pb.set_message(format!("Track {}", track_number));
         }
 
-        // Calculate total samples per channel for DSF header
-        // DSD64: 2822400 Hz, so samples = duration_seconds * 2822400
+        // Total samples per channel for DSF header.
         let duration_seconds = track_duration.minutes as u64 * 60
             + track_duration.seconds as u64
-            + track_duration.frames as u64 / 75;
+            + track_duration.frames as u64 / FRAMES_PER_SECOND as u64;
         let total_samples_per_channel = duration_seconds * DSD64_SAMPLE_RATE as u64;
 
         let mut dsf_writer = DsfWriter::create(
@@ -158,21 +158,21 @@ impl<R: SacdReader> TrackExtractor<R> {
         // Timecode filter — only frames whose timecode is in
         // [track_start, track_start + track_duration) are decoded. This
         // matches sacd-ripper's default `audio_frame_trimming=1` mode.
-        let start_fc = track_start_time.minutes as u32 * 60 * 75
-            + track_start_time.seconds as u32 * 75
+        let start_fc = track_start_time.minutes as u32 * FRAMES_PER_MINUTE
+            + track_start_time.seconds as u32 * FRAMES_PER_SECOND
             + track_start_time.frames as u32;
-        let dur_fc = track_duration.minutes as u32 * 60 * 75
-            + track_duration.seconds as u32 * 75
+        let dur_fc = track_duration.minutes as u32 * FRAMES_PER_MINUTE
+            + track_duration.seconds as u32 * FRAMES_PER_SECOND
             + track_duration.frames as u32;
         let end_fc = start_fc + dur_fc;
         // The existing helper takes m/s/f triples, so convert.
         audio_parser.set_timecode_filter(
-            (start_fc / (60 * 75)) as u8,
-            ((start_fc / 75) % 60) as u8,
-            (start_fc % 75) as u8,
-            (end_fc / (60 * 75)) as u8,
-            ((end_fc / 75) % 60) as u8,
-            (end_fc % 75) as u8,
+            (start_fc / FRAMES_PER_MINUTE) as u8,
+            ((start_fc / FRAMES_PER_SECOND) % 60) as u8,
+            (start_fc % FRAMES_PER_SECOND) as u8,
+            (end_fc / FRAMES_PER_MINUTE) as u8,
+            ((end_fc / FRAMES_PER_SECOND) % 60) as u8,
+            (end_fc % FRAMES_PER_SECOND) as u8,
         );
 
         // Streaming producer-consumer pipeline. A producer thread reads

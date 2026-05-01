@@ -6,6 +6,7 @@
 // MPEG-4 Audio RM Module - Lossless coding of 1-bit oversampled audio
 // ISO/IEC 14496-3:2001/Amd 6:2005
 
+use crate::scarletbook::consts::{DSD64_SAMPLE_RATE, DSD128_SAMPLE_RATE, DSD256_SAMPLE_RATE};
 use anyhow::{Result, bail};
 
 // ============================================================================
@@ -423,10 +424,10 @@ impl DstDecoder {
         // The C reference computes MaxFrameLen as `588 * SampleRate / 8`
         // where SampleRate is an Fs44 multiplier (64/128/256). Validate
         // and translate the Hz value here; we don't need to retain it.
-        let fsample_44: i64 = match sample_rate {
-            2_822_400 => 64,
-            5_644_800 => 128,
-            11_289_600 => 256,
+        let fsample_44: i64 = match sample_rate as u32 {
+            DSD64_SAMPLE_RATE => 64,
+            DSD128_SAMPLE_RATE => 128,
+            DSD256_SAMPLE_RATE => 256,
             _ => bail!("Unsupported sample rate: {}", sample_rate),
         };
         let max_frame_len = 588 * fsample_44 / 8;

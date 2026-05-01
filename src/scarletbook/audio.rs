@@ -1,3 +1,4 @@
+use crate::scarletbook::consts::{FRAMES_PER_MINUTE, FRAMES_PER_SECOND};
 use crate::scarletbook::types::FrameFormat;
 use anyhow::Result;
 use log::{debug, trace};
@@ -82,10 +83,11 @@ impl AudioFrameInfo {
         }
     }
 
-    /// Convert timecode to frame count (matching C code's TIME_FRAMECOUNT macro)
-    /// Formula: minutes * 60 * 75 + seconds * 75 + frames
+    /// Convert timecode to frame count (matching C code's TIME_FRAMECOUNT macro).
     pub fn to_frame_count(self) -> u32 {
-        self.minutes as u32 * 60 * 75 + self.seconds as u32 * 75 + self.frames as u32
+        self.minutes as u32 * FRAMES_PER_MINUTE
+            + self.seconds as u32 * FRAMES_PER_SECOND
+            + self.frames as u32
     }
 
     /// Derive channel count from `channel_bit_2/3`, matching the C
@@ -197,10 +199,12 @@ impl AudioSectorParser {
         end_seconds: u8,
         end_frames: u8,
     ) {
-        let start_frame_count =
-            start_minutes as u32 * 60 * 75 + start_seconds as u32 * 75 + start_frames as u32;
-        let end_frame_count =
-            end_minutes as u32 * 60 * 75 + end_seconds as u32 * 75 + end_frames as u32;
+        let start_frame_count = start_minutes as u32 * FRAMES_PER_MINUTE
+            + start_seconds as u32 * FRAMES_PER_SECOND
+            + start_frames as u32;
+        let end_frame_count = end_minutes as u32 * FRAMES_PER_MINUTE
+            + end_seconds as u32 * FRAMES_PER_SECOND
+            + end_frames as u32;
         self.timecode_filter = Some((start_frame_count, end_frame_count));
         log::info!(
             "Timecode filter set: [{:02}:{:02}:{:02} - {:02}:{:02}:{:02}) = [frame {} - frame {})",
