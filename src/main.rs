@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 mod sacd_reader;
 mod scarletbook;
+mod dst_decoder;
 
 use sacd_reader::IsoReader;
 use sacd_reader::NetReader;

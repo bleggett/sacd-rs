@@ -1,5 +1,6 @@
 pub mod sacd_reader;
 pub mod scarletbook;
+pub mod dst_decoder;
 
 pub mod sacd_ripper {
     include!(concat!(env!("OUT_DIR"), "/libsacd.sacd_ripper.rs"));

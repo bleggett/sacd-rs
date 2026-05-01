@@ -1,5 +1,5 @@
 use crate::scarletbook::types::FrameFormat;
-use crate::scarletbook::dst_decoder::DstDecoder;
+use crate::dst_decoder::decoder::DstDecoder;
 use anyhow::Result;
 use log::{trace, debug};
 
