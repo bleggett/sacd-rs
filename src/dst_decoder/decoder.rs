@@ -1067,7 +1067,7 @@ impl DstDecoder {
         let i_coef_i = self.build_filter_tables();
 
         // Status as 4 u32 words per channel (matches the C macro that shifts
-        // 32-bit words). Initial value: all bytes 0xAA → each word = 0xAAAAAAAA.
+        // 32-bit words). Initial value: all bytes 0xAA -> each word = 0xAAAAAAAA.
         let mut status: Vec<[u32; 4]> = vec![[0xAAAA_AAAAu32; 4]; nr_of_channels];
 
         // Init AC and decode the first dummy bit using Reverse7LSBs(ICoefA[0][0]).
@@ -1228,7 +1228,7 @@ fn fir_predict_sse2(ftable: &[[i16; 256]; 16], st: &[u32; 4]) -> i16 {
             ftable[9][((w2 >> 8) & 0xff) as usize],
             ftable[8][(w2 & 0xff) as usize],
         );
-        // Pairwise → 8 lanes, then horizontal-reduce 8 → 1.
+        // Pairwise -> 8 lanes, then horizontal-reduce 8 -> 1.
         let s = _mm_add_epi16(v0, v1);
         let s = _mm_add_epi16(s, _mm_srli_si128(s, 8));
         let s = _mm_add_epi16(s, _mm_srli_si128(s, 4));
@@ -1265,8 +1265,8 @@ unsafe fn fir_predict_avx2(ftable: &[[i16; 256]; 16], st: &[u32; 4]) -> i16 {
         ftable[1][((w0 >> 8) & 0xff) as usize],
         ftable[0][(w0 & 0xff) as usize],
     );
-    // Fold 16 → 8 i16 lanes (pairwise add of high and low halves), then
-    // horizontal-reduce 8 → 1 with SSE2 shuffles.
+    // Fold 16 -> 8 i16 lanes (pairwise add of high and low halves), then
+    // horizontal-reduce 8 -> 1 with SSE2 shuffles.
     let lo = _mm256_castsi256_si128(v);
     let hi = _mm256_extracti128_si256::<1>(v);
     let s = _mm_add_epi16(lo, hi);

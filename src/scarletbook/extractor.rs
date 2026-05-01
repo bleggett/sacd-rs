@@ -13,6 +13,33 @@ use log::debug;
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+/// Producer-thread instrumentation, returned via `JoinHandle::join`.
+struct ProducerStats {
+    decoded_frames: u64,
+    filtered_frames: u64,
+    /// Wall-clock spent in `reader.read_data` (sector I/O).
+    t_read_ns: u64,
+    /// Wall-clock spent in `audio_parser.parse_sector`.
+    t_parse_ns: u64,
+    /// Wall-clock spent blocked on `tx.send` (channel full -> consumer slow).
+    t_send_blocked_ns: u64,
+    /// Number of frames sent into the channel.
+    send_calls: u64,
+}
+
+/// Writer-thread instrumentation, returned alongside the writer.
+struct WriterStats {
+    /// Wall-clock spent inside `DsfWriter::write_samples`.
+    t_write_ns: u64,
+    /// Wall-clock spent blocked on `rx.recv` (queue empty -> decoder slow).
+    t_recv_blocked_ns: u64,
+    /// Number of decoded batches consumed.
+    batches: u64,
+    /// Number of frames written.
+    frames: u64,
+}
 
 /// Track extractor for extracting SACD tracks to DSF files
 pub struct TrackExtractor<R: SacdReader> {
@@ -175,46 +202,74 @@ impl<R: SacdReader> TrackExtractor<R> {
             (end_fc % FRAMES_PER_SECOND) as u8,
         );
 
-        // Streaming producer-consumer pipeline. A producer thread reads
-        // sectors and parses them into raw frame bytes, sending each frame
-        // through a bounded mpsc channel. The main thread receives frames in
-        // batches, decodes each batch in parallel (rayon, thread-local
-        // DstDecoders), and writes the decoded frames to the DSF in order.
+        // Three-stage streaming pipeline:
         //
-        // The bounded channel is what enables I/O–compute overlap for slow
-        // sources (e.g. NetReader): the producer keeps fetching sectors
-        // while the consumer is busy decoding/writing. For a fast local ISO
-        // the producer simply backpressures on a full channel; total work
-        // is the same as a sequential decode.
+        //   producer thread  ->  decoder (main thread)  ->  writer thread
+        //          tx_raw                              tx_decoded
         //
-        // Memory cap: CHANNEL_CAPACITY raw DST frames in flight + one
-        // BATCH_SIZE-sized batch being decoded ≈ <10 MB for DSD64.
+        // - producer reads sectors, parses them into raw DST frames, sends
+        //   one frame at a time over `tx_raw`.
+        // - decoder (main) batches up to BATCH_SIZE raw frames, runs the
+        //   parallel rayon decode, and forwards the decoded batch over
+        //   `tx_decoded`.
+        // - writer owns the `DsfWriter`, drains `tx_decoded` in order, and
+        //   calls `write_samples` on each decoded frame.
+        //
+        // The two channels mean writer-of-batch-N runs concurrently with
+        // decoder-of-batch-N+1 and with producer-of-frames-for-batch-N+2.
+        // For local-ISO extraction this overlaps the per-byte DSF write
+        // path with the next parallel decode.
+        //
+        // Memory cap: CHANNEL_CAPACITY raw frames + DECODED_QUEUE_DEPTH
+        // decoded batches in flight ≈ <60 MB for stereo DSD64.
         const BATCH_SECTORS: u32 = 256;
         const SECTOR: usize = 2048;
         const BATCH_SIZE: usize = 256;
         // ~16k raw DST frames in flight ≈ ~50 MB at typical 3 KB/frame.
-        // Generous enough to absorb multi-second network stalls; for a
-        // local ISO the producer just backpressures on a full channel
-        // before this fills up.
         const CHANNEL_CAPACITY: usize = 16384;
+        // Small queue between decoder and writer. Each slot holds one
+        // decoded batch ≈ BATCH_SIZE * dsd_frame_bytes (~2.4 MB for stereo
+        // DSD64). 4 slots = ~10 MB.
+        const DECODED_QUEUE_DEPTH: usize = 4;
 
         let is_dst = matches!(area_toc.frame_format, FrameFormat::Dst);
         let channels = area_toc.channel_count as usize;
         let sample_rate = DSD64_SAMPLE_RATE as usize;
         let track_num = track_number;
 
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(CHANNEL_CAPACITY);
+        let (tx_raw, rx_raw) = std::sync::mpsc::sync_channel::<Vec<u8>>(CHANNEL_CAPACITY);
+        let (tx_decoded, rx_decoded) =
+            std::sync::mpsc::sync_channel::<Vec<Vec<u8>>>(DECODED_QUEUE_DEPTH);
         let reader: &mut R = &mut self.reader;
+        let writer_pb = progress_bar.cloned();
+        let dsf_writer_for_thread = dsf_writer;
+
+        // Decoder workers pop a buffer (allocating fresh if empty); writer
+        // recycles each batch back after writing. Steady-state in-flight
+        // working set is ~one batch's worth of buffers.
+        let buffer_pool: Arc<Mutex<Vec<Vec<u8>>>> =
+            Arc::new(Mutex::new(Vec::with_capacity(BATCH_SIZE * 2)));
+        let pool_for_decoder = Arc::clone(&buffer_pool);
+        let pool_for_writer = Arc::clone(&buffer_pool);
+
+        let pipeline_start = std::time::Instant::now();
 
         std::thread::scope(|s| -> Result<()> {
-            // ---- Producer ----
-            let producer = s.spawn(move || -> Result<(u64, u64)> {
+            let producer = s.spawn(move || -> Result<ProducerStats> {
+                use std::time::Instant;
+                let mut t_read_ns: u64 = 0;
+                let mut t_parse_ns: u64 = 0;
+                let mut t_send_blocked_ns: u64 = 0;
+                let mut send_calls: u64 = 0;
+
                 let mut current_lsn = start_lsn;
                 'outer: while current_lsn < end_lsn {
                     let want = (end_lsn - current_lsn).min(BATCH_SECTORS);
+                    let t_read = Instant::now();
                     let chunk = reader
                         .read_data(current_lsn, want)
                         .with_context(|| format!("read {} sectors @ LSN {}", want, current_lsn))?;
+                    t_read_ns += t_read.elapsed().as_nanos() as u64;
                     if chunk.len() < (want as usize) * SECTOR {
                         anyhow::bail!(
                             "Short read at LSN {}: got {} bytes, expected {}",
@@ -226,57 +281,117 @@ impl<R: SacdReader> TrackExtractor<R> {
                     for i in 0..want {
                         let off = (i as usize) * SECTOR;
                         let sector = &chunk[off..off + SECTOR];
-                        if let Some(raw) = audio_parser.parse_sector(sector)?
-                            && tx.send(raw).is_err()
-                        {
-                            // Consumer dropped (almost certainly due to
-                            // a write/decode error). Stop producing —
-                            // the consumer's error will be propagated.
-                            break 'outer;
+                        let t_parse = Instant::now();
+                        let frame = audio_parser.parse_sector(sector)?;
+                        t_parse_ns += t_parse.elapsed().as_nanos() as u64;
+                        if let Some(raw) = frame {
+                            send_calls += 1;
+                            let t_send = Instant::now();
+                            let send_res = tx_raw.send(raw);
+                            t_send_blocked_ns += t_send.elapsed().as_nanos() as u64;
+                            if send_res.is_err() {
+                                break 'outer;
+                            }
                         }
                     }
                     current_lsn += want;
                 }
                 if let Some(raw) = audio_parser.flush() {
-                    let _ = tx.send(raw);
+                    let _ = tx_raw.send(raw);
                 }
-                Ok((audio_parser.decoded_frames, audio_parser.filtered_frames))
-                // tx dropped here -> consumer's recv() returns Err, ending its loop.
+                Ok(ProducerStats {
+                    decoded_frames: audio_parser.decoded_frames,
+                    filtered_frames: audio_parser.filtered_frames,
+                    t_read_ns,
+                    t_parse_ns,
+                    t_send_blocked_ns,
+                    send_calls,
+                })
+                // tx_raw dropped here -> decoder's rx_raw.recv() returns Err.
             });
 
-            // ---- Consumer (this thread) ----
-            // Run the consumer in an inner scope so `rx` is dropped when it
-            // returns (including via `?`). Dropping `rx` unblocks any
-            // producer waiting on a full channel after a consumer error.
-            let consumer_pb = progress_bar.cloned();
-            // Per-track rayon worker pool. Building a dedicated pool here
-            // (instead of using rayon's global pool) means the worker
-            // threads — and therefore their `TLS_DECODER` slots — are
-            // created fresh for each track, which simplifies init.
+            let writer = s.spawn(move || -> Result<(DsfWriter, WriterStats)> {
+                use std::time::Instant;
+                let mut dsf_writer = dsf_writer_for_thread;
+                let mut t_write_ns: u64 = 0;
+                let mut t_recv_blocked_ns: u64 = 0;
+                let mut batches: u64 = 0;
+                let mut frames: u64 = 0;
+                loop {
+                    let t_recv = Instant::now();
+                    let batch = match rx_decoded.recv() {
+                        Ok(b) => b,
+                        Err(_) => break,
+                    };
+                    t_recv_blocked_ns += t_recv.elapsed().as_nanos() as u64;
+
+                    let t_w = Instant::now();
+                    for f in &batch {
+                        dsf_writer.write_samples(f)?;
+                    }
+                    t_write_ns += t_w.elapsed().as_nanos() as u64;
+                    frames += batch.len() as u64;
+                    batches += 1;
+                    if let Some(pb) = writer_pb.as_ref() {
+                        pb.set_position(frames);
+                    }
+                    // Recycle this batch's buffers back into the shared pool.
+                    // Single lock per batch keeps contention with decoder
+                    // workers low.
+                    let mut pool = pool_for_writer.lock().unwrap();
+                    pool.extend(batch);
+                }
+                Ok((
+                    dsf_writer,
+                    WriterStats {
+                        t_write_ns,
+                        t_recv_blocked_ns,
+                        batches,
+                        frames,
+                    },
+                ))
+            });
+
+            // Per-track rayon pool: workers (and their TLS DstDecoders) are
+            // torn down at scope exit so a stereo track's 2-channel decoder
+            // can't be reused for a multi-channel track.
             let pool = rayon::ThreadPoolBuilder::new()
                 .thread_name(|i| format!("dst-decode-{}", i))
                 .build()
                 .map_err(|e| anyhow::anyhow!("rayon pool: {}", e))?;
 
-            let consumer_res = (|rx: std::sync::mpsc::Receiver<Vec<u8>>| -> Result<()> {
+            let mut t_recv_blocked_ns: u64 = 0;
+            let mut t_decode_ns: u64 = 0;
+            let mut t_send_decoded_blocked_ns: u64 = 0;
+            let mut batches_processed: u64 = 0;
+
+            let decoder_res = (|rx_raw: std::sync::mpsc::Receiver<Vec<u8>>,
+                                tx_decoded: std::sync::mpsc::SyncSender<Vec<Vec<u8>>>,
+                                t_recv_blocked_ns: &mut u64,
+                                t_decode_ns: &mut u64,
+                                t_send_decoded_blocked_ns: &mut u64,
+                                batches_processed: &mut u64|
+             -> Result<()> {
+                use std::time::Instant;
                 thread_local! {
                     static TLS_DECODER: RefCell<Option<DstDecoder>> = const {
                         RefCell::new(None)
                     };
                 }
                 let mut batch: Vec<Vec<u8>> = Vec::with_capacity(BATCH_SIZE);
-                let mut frames_written: u64 = 0;
-                let mut process = |batch: &mut Vec<Vec<u8>>,
-                                   dsf_writer: &mut DsfWriter|
+
+                let process = |batch: &mut Vec<Vec<u8>>,
+                                   t_decode_ns: &mut u64,
+                                   t_send_decoded_blocked_ns: &mut u64,
+                                   batches_processed: &mut u64|
                  -> Result<()> {
                     if batch.is_empty() {
                         return Ok(());
                     }
-                    let n = batch.len() as u64;
-                    if is_dst {
-                        // Parallel decode of this batch on the
-                        // per-track pool.
-                        let decoded: Result<Vec<Vec<u8>>> = pool.install(|| {
+                    let decoded: Vec<Vec<u8>> = if is_dst {
+                        let t_dec = Instant::now();
+                        let buffer_pool = &pool_for_decoder;
+                        let res: Result<Vec<Vec<u8>>> = pool.install(|| {
                             batch
                                 .par_iter()
                                 .map(|raw| -> Result<Vec<u8>> {
@@ -286,58 +401,128 @@ impl<R: SacdReader> TrackExtractor<R> {
                                             *slot = Some(DstDecoder::new(channels, sample_rate)?);
                                         }
                                         let dec = slot.as_mut().unwrap();
-                                        let mut buf = vec![0u8; dec.dsd_frame_bytes()];
+                                        let needed = dec.dsd_frame_bytes();
+                                        // Reuse a buffer from the writer's
+                                        // recycle pool when available, else
+                                        // allocate. Either way the buffer
+                                        // is sized to `needed`; decode_frame
+                                        // re-zeros what it needs internally.
+                                        let mut buf = buffer_pool
+                                            .lock()
+                                            .unwrap()
+                                            .pop()
+                                            .unwrap_or_else(|| Vec::with_capacity(needed));
+                                        if buf.len() != needed {
+                                            buf.resize(needed, 0);
+                                        }
                                         let n = dec.decode_frame(raw, &mut buf)?;
-                                        buf.truncate(n);
+                                        debug_assert_eq!(n, needed);
                                         Ok(buf)
                                     })
                                 })
                                 .collect()
                         });
-                        for f in decoded? {
-                            dsf_writer.write_samples(&f)?;
-                        }
+                        let d = res?;
+                        *t_decode_ns += t_dec.elapsed().as_nanos() as u64;
+                        d
                     } else {
-                        for raw in batch.iter() {
-                            dsf_writer.write_samples(raw)?;
-                        }
-                    }
+                        // Pass-through for uncompressed DSD: the writer
+                        // accepts the raw chunks directly.
+                        std::mem::take(batch)
+                    };
                     batch.clear();
-                    frames_written += n;
-                    if let Some(pb) = consumer_pb.as_ref() {
-                        pb.set_position(frames_written);
+
+                    let t_send = Instant::now();
+                    let send_res = tx_decoded.send(decoded);
+                    *t_send_decoded_blocked_ns += t_send.elapsed().as_nanos() as u64;
+                    if send_res.is_err() {
+                        anyhow::bail!("writer thread dropped its receiver");
                     }
+                    *batches_processed += 1;
                     Ok(())
                 };
 
-                for raw in rx.iter() {
+                loop {
+                    let t_recv = Instant::now();
+                    let raw = match rx_raw.recv() {
+                        Ok(r) => r,
+                        Err(_) => break,
+                    };
+                    *t_recv_blocked_ns += t_recv.elapsed().as_nanos() as u64;
                     batch.push(raw);
                     if batch.len() >= BATCH_SIZE {
-                        process(&mut batch, &mut dsf_writer)?;
+                        process(
+                            &mut batch,
+                            t_decode_ns,
+                            t_send_decoded_blocked_ns,
+                            batches_processed,
+                        )?;
                     }
                 }
-                process(&mut batch, &mut dsf_writer)?;
+                process(
+                    &mut batch,
+                    t_decode_ns,
+                    t_send_decoded_blocked_ns,
+                    batches_processed,
+                )?;
                 Ok(())
-            })(rx);
+            })(
+                rx_raw,
+                tx_decoded,
+                &mut t_recv_blocked_ns,
+                &mut t_decode_ns,
+                &mut t_send_decoded_blocked_ns,
+                &mut batches_processed,
+            );
+            // tx_decoded dropped here -> writer's rx_decoded.recv() returns Err.
 
             let producer_res = producer
                 .join()
                 .map_err(|_| anyhow::anyhow!("producer thread panicked"))?;
+            let writer_join = writer
+                .join()
+                .map_err(|_| anyhow::anyhow!("writer thread panicked"))?;
+            let pipeline_elapsed = pipeline_start.elapsed();
 
-            // Surface whichever side failed first.
-            consumer_res?;
-            let (decoded_n, filtered_n) = producer_res?;
+            decoder_res?;
+            let p = producer_res?;
+            let (dsf_writer, w) = writer_join?;
+            let decoded_n = p.decoded_frames;
+            let filtered_n = p.filtered_frames;
+
+            let to_ms = |ns: u64| ns as f64 / 1_000_000.0;
+            let pipeline_ns = pipeline_elapsed.as_nanos() as u64;
+            log::debug!(
+                "[track {} timing] pipeline_wall={:.1}ms\n  \
+                 producer: read={:.1}ms parse={:.1}ms send_blocked={:.1}ms (sends={})\n  \
+                 decoder:  recv_blocked={:.1}ms decode={:.1}ms send_blocked={:.1}ms (batches={})\n  \
+                 writer:   recv_blocked={:.1}ms write={:.1}ms (batches={}, frames={})",
+                track_num,
+                to_ms(pipeline_ns),
+                to_ms(p.t_read_ns),
+                to_ms(p.t_parse_ns),
+                to_ms(p.t_send_blocked_ns),
+                p.send_calls,
+                to_ms(t_recv_blocked_ns),
+                to_ms(t_decode_ns),
+                to_ms(t_send_decoded_blocked_ns),
+                batches_processed,
+                to_ms(w.t_recv_blocked_ns),
+                to_ms(w.t_write_ns),
+                w.batches,
+                w.frames,
+            );
             log::info!(
                 "Track {}: yielded {} frames ({} filtered)",
                 track_num,
                 decoded_n,
                 filtered_n,
             );
+
+            // Finalise inside the scope; we own the writer again.
+            dsf_writer.finalize()?;
             Ok(())
         })?;
-
-        // Finalize DSF file
-        dsf_writer.finalize()?;
 
         if let Some(pb) = progress_bar {
             pb.finish_with_message(format!("Track {} complete", track_number));
