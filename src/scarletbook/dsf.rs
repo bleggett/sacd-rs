@@ -150,10 +150,16 @@ impl DsfWriter {
             self.channel_buffer_pos += 1;
 
             // Check if ALL channels' buffers are full (4096 bytes each)
-            if self.channel_buffers.iter().all(|buf| buf.len() >= DSF_BLOCK_SIZE_PER_CHANNEL) {
+            if self
+                .channel_buffers
+                .iter()
+                .all(|buf| buf.len() >= DSF_BLOCK_SIZE_PER_CHANNEL)
+            {
                 // Write all channel blocks in order: ch0, ch1, ch2, ...
                 for channel in 0..self.channel_count as usize {
-                    let block: Vec<u8> = self.channel_buffers[channel].drain(..DSF_BLOCK_SIZE_PER_CHANNEL).collect();
+                    let block: Vec<u8> = self.channel_buffers[channel]
+                        .drain(..DSF_BLOCK_SIZE_PER_CHANNEL)
+                        .collect();
                     self.writer.write_all(&block)?;
                     self.bytes_written += DSF_BLOCK_SIZE_PER_CHANNEL as u64;
                 }
@@ -169,7 +175,9 @@ impl DsfWriter {
         // This function is kept for the finalize() method
         for channel in 0..self.channel_count as usize {
             if self.channel_buffers[channel].len() >= DSF_BLOCK_SIZE_PER_CHANNEL {
-                let block: Vec<u8> = self.channel_buffers[channel].drain(..DSF_BLOCK_SIZE_PER_CHANNEL).collect();
+                let block: Vec<u8> = self.channel_buffers[channel]
+                    .drain(..DSF_BLOCK_SIZE_PER_CHANNEL)
+                    .collect();
                 self.writer.write_all(&block)?;
                 self.bytes_written += DSF_BLOCK_SIZE_PER_CHANNEL as u64;
             }
