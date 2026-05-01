@@ -14,6 +14,16 @@ const FMT_CHUNK_SIZE: u64 = 52;
 /// DSF block size per channel — 4096 bytes is fixed by the DSF spec.
 pub const DSF_BLOCK_SIZE_PER_CHANNEL: usize = 4096;
 
+/// Per-channel partial-block tails saved when nopad mode skips zero-padding
+/// the last DSF block of a track. These bytes are already in DSF on-disk
+/// form (LSB-first) and are pre-loaded into the next consecutive track's
+/// per-channel buffers via `DsfWriter::pre_load_carry`.
+pub struct NopadCarry {
+    /// One Vec per channel; `len() < DSF_BLOCK_SIZE_PER_CHANNEL`. All Vecs
+    /// have the same length.
+    pub channel_tails: Vec<Vec<u8>>,
+}
+
 /// DSF file writer for SACD audio extraction. Note that `sample_rate` and
 /// the up-front `total_samples_per_channel` parameters are written into
 /// the fmt chunk during `create()` but not retained on the struct: the
@@ -34,6 +44,9 @@ pub struct DsfWriter {
     channel_buffer_pos: usize,
     /// Optional ID3 footer to write after the audio data on finalize().
     id3_footer: Option<Vec<u8>>,
+    /// When true, finalize() returns the partial last block as a carry
+    /// instead of zero-padding and writing it. Mirrors C `dsf_nopad`.
+    nopad: bool,
 }
 
 impl DsfWriter {
@@ -114,6 +127,7 @@ impl DsfWriter {
             channel_buffers,
             channel_buffer_pos: 0,
             id3_footer: None,
+            nopad: false,
         })
     }
 
@@ -121,6 +135,33 @@ impl DsfWriter {
     /// the metadata pointer in the DSD chunk happens automatically.
     pub fn set_id3_footer(&mut self, footer: Vec<u8>) {
         self.id3_footer = Some(footer);
+    }
+
+    /// Enable nopad mode: when set, `finalize()` returns the partial last
+    /// block as a `NopadCarry` instead of zero-padding it. Used together
+    /// with `pre_load_carry` on the next consecutive track to avoid the
+    /// inter-track zero-pad gap that some DSF players cannot handle.
+    pub fn set_nopad(&mut self, on: bool) {
+        self.nopad = on;
+    }
+
+    /// Pre-load the per-channel buffers with a carry produced by the
+    /// previous consecutive track's nopad finalize(). The bytes are already
+    /// in DSF on-disk form (LSB-first) and are placed at the head of each
+    /// channel's buffer; the round-robin write position is advanced so the
+    /// next byte from `write_samples` lands on channel 0.
+    pub fn pre_load_carry(&mut self, carry: NopadCarry) {
+        assert_eq!(
+            carry.channel_tails.len(),
+            self.channel_count as usize,
+            "carry channel count mismatch"
+        );
+        let per_channel = carry.channel_tails.first().map(|v| v.len()).unwrap_or(0);
+        for (ch, tail) in carry.channel_tails.into_iter().enumerate() {
+            debug_assert_eq!(tail.len(), per_channel, "carry tails must be equal length");
+            self.channel_buffers[ch].extend_from_slice(&tail);
+        }
+        self.channel_buffer_pos = per_channel * self.channel_count as usize;
     }
 
     /// Write DSD audio samples
@@ -185,17 +226,37 @@ impl DsfWriter {
         Ok(())
     }
 
-    /// Finish writing the DSF file and update headers with final sizes
-    pub fn finalize(mut self) -> Result<()> {
-        // Flush any remaining partial blocks (pad with zeros if needed)
-        if self.channel_buffers.iter().any(|buf| !buf.is_empty()) {
-            for channel_buf in &mut self.channel_buffers {
-                if channel_buf.len() < DSF_BLOCK_SIZE_PER_CHANNEL {
-                    channel_buf.resize(DSF_BLOCK_SIZE_PER_CHANNEL, 0);
+    /// Finish writing the DSF file and update headers with final sizes.
+    ///
+    /// Returns `Some(NopadCarry)` when nopad mode is enabled and the track
+    /// ended with a non-empty partial block; the caller is responsible for
+    /// passing that carry to the next consecutive track via
+    /// `pre_load_carry`. Returns `None` otherwise (default zero-pad path).
+    pub fn finalize(mut self) -> Result<Option<NopadCarry>> {
+        let has_partial = self.channel_buffers.iter().any(|buf| !buf.is_empty());
+
+        let carry = if self.nopad && has_partial {
+            // Steal the partial tails per channel for the caller. Do not
+            // pad/flush; bytes_written and the data chunk size stay at
+            // their pre-tail values so this file's audio length is shorter
+            // than `ceil(N/4096)*4096` per channel.
+            let channel_tails: Vec<Vec<u8>> = self
+                .channel_buffers
+                .iter_mut()
+                .map(std::mem::take)
+                .collect();
+            Some(NopadCarry { channel_tails })
+        } else {
+            if has_partial {
+                for channel_buf in &mut self.channel_buffers {
+                    if channel_buf.len() < DSF_BLOCK_SIZE_PER_CHANNEL {
+                        channel_buf.resize(DSF_BLOCK_SIZE_PER_CHANNEL, 0);
+                    }
                 }
+                self.flush_channel_block()?;
             }
-            self.flush_channel_block()?;
-        }
+            None
+        };
 
         let audio_end_pos = self.writer.stream_position()?;
 
@@ -216,9 +277,18 @@ impl DsfWriter {
 
         // Patch fmt chunk's sample_count (offset 28 + 12 + 4*5 = 60) so that it
         // reflects the actual decoded sample count, not the padded one.
-        // sample_count = decoded_bytes_total / channels * 8.
+        // In nopad mode the partial tail is held over to the next track so
+        // it must not be reflected in this file's sample_count; derive
+        // sample_count from `bytes_written` (matches C `handle->sample_count
+        // / channel_count * 8` when nopad skips the final block flush).
+        // In default pad mode the existing decoded-bytes accounting matches
+        // the C reference bit-for-bit on block-aligned tracks.
         let channels = self.channel_count.max(1) as u64;
-        let sample_count = self.decoded_bytes_total / channels * 8;
+        let sample_count = if carry.is_some() {
+            self.bytes_written / channels * 8
+        } else {
+            self.decoded_bytes_total / channels * 8
+        };
         // Layout: DSD(28) + fmt header (id 4 + size 8) + version 4 + format_id 4
         //         + channel_type 4 + channel_count 4 + sample_freq 4
         //         + bits_per_sample 4 = 28 + 12 + 4 + 4 + 4 + 4 + 4 + 4 = 64.
@@ -232,7 +302,7 @@ impl DsfWriter {
         self.writer.write_u64::<LittleEndian>(data_chunk_size)?;
 
         self.writer.flush()?;
-        Ok(())
+        Ok(carry)
     }
 }
 

@@ -3,7 +3,7 @@ use crate::sacd_reader::SacdReader;
 use crate::scarletbook::area_toc::AreaToc;
 use crate::scarletbook::audio::AudioSectorParser;
 use crate::scarletbook::consts::{DSD64_SAMPLE_RATE, FRAMES_PER_MINUTE, FRAMES_PER_SECOND};
-use crate::scarletbook::dsf::DsfWriter;
+use crate::scarletbook::dsf::{DsfWriter, NopadCarry};
 use crate::scarletbook::id3::render_id3;
 use crate::scarletbook::master_toc::{MasterText, MasterToc};
 use crate::scarletbook::types::FrameFormat;
@@ -55,6 +55,12 @@ impl<R: SacdReader> TrackExtractor<R> {
     /// Extract a single track to a DSF file. The reader must be `Send`
     /// because the producer phase of the streaming pipeline runs on a
     /// separate thread (sectors are read in parallel with decode/write).
+    ///
+    /// `nopad`: if true, the partial last DSF block is held over instead of
+    /// being zero-padded; the held-over bytes are returned as
+    /// `Some(NopadCarry)` for the caller to feed into the next consecutive
+    /// track. `carry_in`: pre-load the per-channel buffers with a carry
+    /// from the previous consecutive track.
     pub fn extract_track(
         &mut self,
         master_toc: &MasterToc,
@@ -63,7 +69,9 @@ impl<R: SacdReader> TrackExtractor<R> {
         track_number: usize,
         output_path: &Path,
         progress_bar: Option<&ProgressBar>,
-    ) -> Result<()>
+        nopad: bool,
+        carry_in: Option<NopadCarry>,
+    ) -> Result<Option<NopadCarry>>
     where
         R: Send,
     {
@@ -173,6 +181,13 @@ impl<R: SacdReader> TrackExtractor<R> {
         )
         .context("Failed to create DSF file")?;
 
+        if nopad {
+            dsf_writer.set_nopad(true);
+        }
+        if let Some(carry) = carry_in {
+            dsf_writer.pre_load_carry(carry);
+        }
+
         // Generate ID3v2.3 footer matching the layout sacd-ripper writes.
         let id3 = render_id3(master_toc, master_text, area_toc, track_idx);
         dsf_writer.set_id3_footer(id3);
@@ -254,7 +269,7 @@ impl<R: SacdReader> TrackExtractor<R> {
 
         let pipeline_start = std::time::Instant::now();
 
-        std::thread::scope(|s| -> Result<()> {
+        let carry_out = std::thread::scope(|s| -> Result<Option<NopadCarry>> {
             let producer = s.spawn(move || -> Result<ProducerStats> {
                 use std::time::Instant;
                 let mut t_read_ns: u64 = 0;
@@ -519,16 +534,18 @@ impl<R: SacdReader> TrackExtractor<R> {
                 filtered_n,
             );
 
-            // Finalise inside the scope; we own the writer again.
-            dsf_writer.finalize()?;
-            Ok(())
+            // Finalise inside the scope; we own the writer again. In nopad
+            // mode the partial tail is returned as a carry for the caller
+            // to pass into the next consecutive track.
+            let carry = dsf_writer.finalize()?;
+            Ok(carry)
         })?;
 
         if let Some(pb) = progress_bar {
             pb.finish_with_message(format!("Track {} complete", track_number));
         }
 
-        Ok(())
+        Ok(carry_out)
     }
 
     /// Extract multiple tracks from an area
@@ -546,6 +563,7 @@ impl<R: SacdReader> TrackExtractor<R> {
         track_numbers: &[usize],
         output_dir: &Path,
         prefix: &str,
+        nopad: bool,
     ) -> Result<()>
     where
         R: Send,
@@ -568,7 +586,14 @@ impl<R: SacdReader> TrackExtractor<R> {
             }
         );
 
-        // Extract each track
+        // Per-track nopad carry: holds the tail (track_idx, carry) of the
+        // most recent track that ended without a zero-pad. The next track's
+        // index must equal `track_idx + 1` for the carry to apply; on a
+        // non-consecutive selection the carry is silently dropped (matches
+        // C, where the help text warns "-z cannot be used with -t").
+        let mut pending_carry: Option<(usize, NopadCarry)> = None;
+        let last_track_idx_in_area = area_toc.track_count.saturating_sub(1) as usize;
+
         for &track_num in &tracks_to_extract {
             // Get track title if available
             let track_title = area_toc
@@ -593,15 +618,31 @@ impl<R: SacdReader> TrackExtractor<R> {
                     .progress_chars("#>-"),
             );
 
+            let track_idx = track_num - 1;
+            // Apply nopad on every track except the last in the area; on
+            // the last track C always pads regardless of the flag, since
+            // there's no next track to carry into.
+            let apply_nopad = nopad && track_idx < last_track_idx_in_area;
+            let carry_in = match pending_carry.take() {
+                Some((prev_idx, carry)) if prev_idx + 1 == track_idx => Some(carry),
+                _ => None,
+            };
+
             // Extract track
-            self.extract_track(
+            let carry_out = self.extract_track(
                 master_toc,
                 master_text,
                 area_toc,
                 track_num,
                 &output_path,
                 Some(&pb),
+                apply_nopad,
+                carry_in,
             )?;
+
+            if let Some(carry) = carry_out {
+                pending_carry = Some((track_idx, carry));
+            }
 
             println!("Saved to: {}", output_path.display());
         }

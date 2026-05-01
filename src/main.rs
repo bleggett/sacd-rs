@@ -66,6 +66,12 @@ enum Commands {
         /// Select specific tracks to extract (e.g., "1,2,5" or "1-3,5")
         #[arg(short, long)]
         tracks: Option<String>,
+
+        /// Do not zero-pad DSF: carry the partial last block of each track
+        /// over to the start of the next consecutive track (gapless
+        /// playback; cannot be combined sensibly with non-consecutive -t).
+        #[arg(short = 'z', long = "dsf-nopad")]
+        nopad: bool,
     },
     /// Extract DSF files directly from a network SACD server (no ISO needed)
     ExtractNet {
@@ -87,6 +93,12 @@ enum Commands {
         /// Select specific tracks to extract (e.g., "1,2,5" or "1-3,5")
         #[arg(short, long)]
         tracks: Option<String>,
+
+        /// Do not zero-pad DSF: carry the partial last block of each track
+        /// over to the start of the next consecutive track (gapless
+        /// playback; cannot be combined sensibly with non-consecutive -t).
+        #[arg(short = 'z', long = "dsf-nopad")]
+        nopad: bool,
     },
 }
 
@@ -237,6 +249,7 @@ fn main() -> Result<()> {
             stereo,
             multi_channel,
             tracks,
+            nopad,
         } => {
             // Validate that the ISO file exists
             if !iso.exists() {
@@ -313,6 +326,7 @@ fn main() -> Result<()> {
                             &selected_tracks,
                             &output,
                             &format!("{}-stereo", disc_prefix),
+                            nopad,
                         )
                         .context("Failed to extract stereo tracks")?;
                 } else {
@@ -332,6 +346,7 @@ fn main() -> Result<()> {
                             &selected_tracks,
                             &output,
                             &format!("{}-mch", disc_prefix),
+                            nopad,
                         )
                         .context("Failed to extract multi-channel tracks")?;
                 } else {
@@ -349,6 +364,7 @@ fn main() -> Result<()> {
             stereo,
             multichannel: multi_channel,
             tracks,
+            nopad,
         } => {
             let (ip, port) = parse_server_address(&server)?;
 
@@ -424,6 +440,7 @@ fn main() -> Result<()> {
                             &selected_tracks,
                             &output,
                             &format!("{}-stereo", disc_prefix),
+                            nopad,
                         )
                         .context("Failed to extract stereo tracks")?;
                 } else {
@@ -443,6 +460,7 @@ fn main() -> Result<()> {
                             &selected_tracks,
                             &output,
                             &format!("{}-mch", disc_prefix),
+                            nopad,
                         )
                         .context("Failed to extract multi-channel tracks")?;
                 } else {
