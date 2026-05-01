@@ -35,7 +35,6 @@ const MIN_FSEG_LEN: i32 = 1024;
 const MIN_PSEG_LEN: i32 = 32;
 
 pub const MAX_CHANNELS: usize = 6;
-pub const MAX_DSDBITS_INFRAME: usize = 588 * 64;
 const MAXNROF_SEGS: usize = 8;
 
 // AC encoder register sizes
@@ -86,7 +85,9 @@ impl DstError {
             DstError::TooManyTables => "Too many tables for this frame",
             DstError::InvalidTableNumber => "Invalid table number for segment",
             DstError::InvalidChannelMapping => "Mapping can't be the same for all channels",
-            DstError::SegmentNumberMismatch => "Not same number of segments for filters and Ptables",
+            DstError::SegmentNumberMismatch => {
+                "Not same number of segments for filters and Ptables"
+            }
             DstError::InvalidCoefficientCoding => "Invalid coefficient coding method",
             DstError::InvalidCoefficientRange => "Filter coefficient out of range",
             DstError::InvalidPtableCoding => "Invalid Ptable coding method",
@@ -270,14 +271,12 @@ fn ac_get_ptable_index(predict: i16, ptable_len: i32) -> i32 {
 // ============================================================================
 
 const REVERSE7: [i16; 128] = [
-    1, 65, 33, 97, 17, 81, 49, 113, 9, 73, 41, 105, 25, 89, 57, 121,
-    5, 69, 37, 101, 21, 85, 53, 117, 13, 77, 45, 109, 29, 93, 61, 125,
-    3, 67, 35, 99, 19, 83, 51, 115, 11, 75, 43, 107, 27, 91, 59, 123,
-    7, 71, 39, 103, 23, 87, 55, 119, 15, 79, 47, 111, 31, 95, 63, 127,
-    2, 66, 34, 98, 18, 82, 50, 114, 10, 74, 42, 106, 26, 90, 58, 122,
-    6, 70, 38, 102, 22, 86, 54, 118, 14, 78, 46, 110, 30, 94, 62, 126,
-    4, 68, 36, 100, 20, 84, 52, 116, 12, 76, 44, 108, 28, 92, 60, 124,
-    8, 72, 40, 104, 24, 88, 56, 120, 16, 80, 48, 112, 32, 96, 64, 128,
+    1, 65, 33, 97, 17, 81, 49, 113, 9, 73, 41, 105, 25, 89, 57, 121, 5, 69, 37, 101, 21, 85, 53,
+    117, 13, 77, 45, 109, 29, 93, 61, 125, 3, 67, 35, 99, 19, 83, 51, 115, 11, 75, 43, 107, 27, 91,
+    59, 123, 7, 71, 39, 103, 23, 87, 55, 119, 15, 79, 47, 111, 31, 95, 63, 127, 2, 66, 34, 98, 18,
+    82, 50, 114, 10, 74, 42, 106, 26, 90, 58, 122, 6, 70, 38, 102, 22, 86, 54, 118, 14, 78, 46,
+    110, 30, 94, 62, 126, 4, 68, 36, 100, 20, 84, 52, 116, 12, 76, 44, 108, 28, 92, 60, 124, 8, 72,
+    40, 104, 24, 88, 56, 120, 16, 80, 48, 112, 32, 96, 64, 128,
 ];
 
 fn reverse7_lsbs(c: i16) -> i32 {
@@ -373,8 +372,8 @@ struct FrameHeader {
     nr_of_channels: i32,
     nr_of_filters: i32,
     nr_of_ptables: i32,
-    pred_order: Vec<i32>,    // [MaxNrOfFilters]
-    ptable_len: Vec<i32>,    // [MaxNrOfPtables]
+    pred_order: Vec<i32>, // [MaxNrOfFilters]
+    ptable_len: Vec<i32>, // [MaxNrOfPtables]
     /// ICoefA[FilterNr][CoefNr] padded to (1<<SIZE_CODEDPREDORDER) entries.
     i_coef_a: Vec<Vec<i16>>,
     dst_coded: i32,
@@ -414,8 +413,6 @@ pub struct DstDecoder {
     /// Ptable4Bit[ChNr][BitNr], filled per-frame.
     ptable4_bit: Vec<Vec<u8>>,
     channel_count: usize,
-    sample_rate: usize,
-    fsample_44: i32,
 }
 
 impl DstDecoder {
@@ -423,13 +420,16 @@ impl DstDecoder {
         if channel_count == 0 || channel_count > MAX_CHANNELS {
             bail!("Invalid channel count: {}", channel_count);
         }
-        let fsample_44 = match sample_rate {
+        // The C reference computes MaxFrameLen as `588 * SampleRate / 8`
+        // where SampleRate is an Fs44 multiplier (64/128/256). Validate
+        // and translate the Hz value here; we don't need to retain it.
+        let fsample_44: i64 = match sample_rate {
             2_822_400 => 64,
             5_644_800 => 128,
             11_289_600 => 256,
             _ => bail!("Unsupported sample rate: {}", sample_rate),
         };
-        let max_frame_len = (588 * fsample_44 / 8) as i64;
+        let max_frame_len = 588 * fsample_44 / 8;
         let nr_of_bits_per_ch = max_frame_len * RESOL;
         let max_nr_of_filters = max_nr_of_filters(channel_count);
         let max_nr_of_ptables = max_nr_of_ptables(channel_count);
@@ -454,17 +454,9 @@ impl DstDecoder {
             filter4_bit: vec![vec![0u8; nr_of_bits_per_ch as usize]; MAX_CHANNELS],
             ptable4_bit: vec![vec![0u8; nr_of_bits_per_ch as usize]; MAX_CHANNELS],
             channel_count,
-            sample_rate,
-            fsample_44,
         })
     }
 
-    pub fn channel_count(&self) -> usize {
-        self.channel_count
-    }
-    pub fn sample_rate(&self) -> usize {
-        self.sample_rate
-    }
     /// Number of bytes the decoder writes per frame: max_frame_len * channels.
     pub fn dsd_frame_bytes(&self) -> usize {
         (self.frame_hdr.max_frame_len as usize) * self.channel_count
@@ -842,8 +834,8 @@ impl DstDecoder {
 
             if coded == 0 {
                 self.str_filter.best_method[filter_nr] = -1;
-                for c in 0..pred_order as usize {
-                    coefs[c] = reader.read_short_signed(SIZE_PREDCOEF)?;
+                for c in coefs.iter_mut().take(pred_order as usize) {
+                    *c = reader.read_short_signed(SIZE_PREDCOEF)?;
                 }
             } else {
                 let best_method = reader.read_uint(SIZE_RICEMETHOD)? as i32;
@@ -855,8 +847,8 @@ impl DstDecoder {
                 if cpred_order >= pred_order {
                     bail!(DstError::InvalidCoefficientCoding);
                 }
-                for c in 0..cpred_order as usize {
-                    coefs[c] = reader.read_short_signed(SIZE_PREDCOEF)?;
+                for c in coefs.iter_mut().take(cpred_order as usize) {
+                    *c = reader.read_short_signed(SIZE_PREDCOEF)?;
                 }
                 let m = reader.read_uint(SIZE_RICEM)? as i32;
                 self.str_filter.m[filter_nr][best_method as usize] = m;
@@ -999,24 +991,20 @@ impl DstDecoder {
         s: &Segment,
         table_4bit: &mut [Vec<u8>],
     ) {
-        for ch in 0..nr_of_channels {
+        for (ch, dst) in table_4bit.iter_mut().take(nr_of_channels).enumerate() {
             let mut start = 0usize;
             let mut last_seg = 0usize;
             let n = s.nr_of_segments[ch] as usize;
             for seg in 0..n.saturating_sub(1) {
                 let val = s.table4_segment[ch][seg] as u8;
                 let end = start + (s.resolution as usize) * 8 * (s.segment_len[ch][seg] as usize);
-                for b in start..end {
-                    table_4bit[ch][b] = val;
-                }
+                dst[start..end].fill(val);
                 start = end;
                 last_seg = seg + 1;
             }
             // Final segment fills the rest.
             let val = s.table4_segment[ch][last_seg] as u8;
-            for b in start..nr_of_bits_per_ch {
-                table_4bit[ch][b] = val;
-            }
+            dst[start..nr_of_bits_per_ch].fill(val);
         }
     }
 
@@ -1027,24 +1015,18 @@ impl DstDecoder {
     fn build_filter_tables(&self) -> Vec<[[i16; 256]; 16]> {
         let nr_of_filters = self.frame_hdr.nr_of_filters as usize;
         let mut out = vec![[[0i16; 256]; 16]; nr_of_filters];
-        for filter_nr in 0..nr_of_filters {
+        for (filter_nr, filter_tables) in out.iter_mut().enumerate() {
             let filter_length = self.frame_hdr.pred_order[filter_nr];
             let coefs = &self.frame_hdr.i_coef_a[filter_nr];
-            for table_nr in 0..16 {
-                let mut k = filter_length - (table_nr as i32) * 8;
-                if k > 8 {
-                    k = 8;
-                } else if k < 0 {
-                    k = 0;
-                }
-                let k = k as usize;
-                for i in 0..256usize {
+            for (table_nr, table) in filter_tables.iter_mut().enumerate() {
+                let k = (filter_length - (table_nr as i32) * 8).clamp(0, 8) as usize;
+                for (i, slot) in table.iter_mut().enumerate() {
                     let mut cvalue: i32 = 0;
                     for j in 0..k {
                         let bit_val = (((i >> j) & 1) as i32) * 2 - 1;
                         cvalue += bit_val * coefs[table_nr * 8 + j] as i32;
                     }
-                    out[filter_nr][table_nr][i] = cvalue as i16;
+                    *slot = cvalue as i16;
                 }
             }
         }
@@ -1135,8 +1117,7 @@ impl DstDecoder {
                     .wrapping_add(ftable[15][((w3 >> 24) & 0xff) as usize]);
 
                 // Decode residual.
-                let residual = if half_prob[ch_nr] != 0
-                    && (bit_nr as i32) < nr_of_half_bits[ch_nr]
+                let residual = if half_prob[ch_nr] != 0 && (bit_nr as i32) < nr_of_half_bits[ch_nr]
                 {
                     ac.decode_bit(AC_PROBS / 2, a_data, a_data_len)
                 } else {
@@ -1212,7 +1193,6 @@ mod tests {
     fn test_decoder_creation() {
         let d = DstDecoder::new(2, 2_822_400).unwrap();
         assert_eq!(d.channel_count, 2);
-        assert_eq!(d.fsample_44, 64);
         assert_eq!(d.frame_hdr.max_frame_len, 4704);
     }
 
@@ -1264,7 +1244,7 @@ mod tests {
     #[test]
     fn test_bit_reader_signed() {
         // 9 bits of 0b1_1110_0101 = 485 unsigned = -27 signed
-        let data = [0b1111_0010u8, 0b1_000_0000];
+        let data = [0b1111_0010u8, 0b1000_0000];
         let mut r = BitReader::new(&data);
         assert_eq!(r.read_int(9).unwrap(), -27);
     }

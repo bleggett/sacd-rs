@@ -21,27 +21,3 @@ pub trait SacdReader {
     /// Get the total number of sectors
     fn get_total_sectors(&mut self) -> Result<u32>;
 }
-
-/// Enumeration of SACD data sources
-pub enum SacdSource {
-    /// ISO file on disk
-    Iso(iso_reader::IsoReader),
-    /// Network SACD server
-    Network(net_reader::NetReader),
-}
-
-impl SacdReader for SacdSource {
-    fn read_data(&mut self, start_lsn: u32, sector_count: u32) -> Result<Vec<u8>> {
-        match self {
-            SacdSource::Iso(reader) => reader.read_data(start_lsn, sector_count),
-            SacdSource::Network(reader) => reader.read_data(start_lsn, sector_count),
-        }
-    }
-
-    fn get_total_sectors(&mut self) -> Result<u32> {
-        match self {
-            SacdSource::Iso(reader) => reader.get_total_sectors(),
-            SacdSource::Network(reader) => reader.get_total_sectors(),
-        }
-    }
-}

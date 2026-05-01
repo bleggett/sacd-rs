@@ -44,19 +44,6 @@ impl From<u8> for FrameFormat {
 }
 
 impl FrameFormat {
-    /// Check if this is a DSD (uncompressed) format
-    pub fn is_dsd(&self) -> bool {
-        matches!(
-            self,
-            FrameFormat::Dsd3In14
-                | FrameFormat::Dsd3In16
-                | FrameFormat::Dsd4
-                | FrameFormat::Dsd5
-                | FrameFormat::Dsd6
-                | FrameFormat::Dsd7
-        )
-    }
-
     /// Get the number of sectors per frame (for calculating track boundaries)
     /// Returns None if unknown or not applicable
     pub fn sectors_per_frame(&self) -> Option<u32> {
@@ -264,15 +251,16 @@ impl Isrc {
     pub fn is_valid(&self) -> bool {
         self.country_code[0] != 0
     }
+}
 
-    /// Get ISRC as a formatted string (e.g., "GBAAA9400468")
-    pub fn to_string(&self) -> String {
-        let mut result = String::with_capacity(12);
-        result.push_str(&String::from_utf8_lossy(&self.country_code));
-        result.push_str(&String::from_utf8_lossy(&self.owner_code));
-        result.push_str(&String::from_utf8_lossy(&self.recording_year));
-        result.push_str(&String::from_utf8_lossy(&self.designation_code));
-        result
+impl std::fmt::Display for Isrc {
+    /// Render as the standard 12-char ISRC string
+    /// (`country` + `owner` + `year` + `designation`, e.g. "GBAAA9400468").
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&String::from_utf8_lossy(&self.country_code))?;
+        f.write_str(&String::from_utf8_lossy(&self.owner_code))?;
+        f.write_str(&String::from_utf8_lossy(&self.recording_year))?;
+        f.write_str(&String::from_utf8_lossy(&self.designation_code))
     }
 }
 

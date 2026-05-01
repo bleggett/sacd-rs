@@ -1,6 +1,6 @@
+pub mod dst_decoder;
 pub mod sacd_reader;
 pub mod scarletbook;
-pub mod dst_decoder;
 
 pub mod sacd_ripper {
     include!(concat!(env!("OUT_DIR"), "/libsacd.sacd_ripper.rs"));
@@ -62,9 +62,11 @@ mod tests {
     #[test]
     fn test_dump_iso() {
         init();
-        let mut handle =
-            sacd_reader::NetReader::open_network_reader(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 130)), 2002)
-                .expect("should init");
+        let mut handle = sacd_reader::NetReader::open_network_reader(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 130)),
+            2002,
+        )
+        .expect("should init");
 
         let pb = ProgressBar::new(0);
         pb.set_style(

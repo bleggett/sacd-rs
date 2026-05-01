@@ -507,10 +507,6 @@ fn read_mch_toc<R: SacdReader>(master_toc: &MasterToc, reader: &mut R) -> Option
 
 #[cfg(test)]
 mod tests {
-    fn init() {
-        let _ = env_logger::builder().is_test(true).try_init();
-    }
-
     // #[test]
     // fn it_works() {
     //     // init();

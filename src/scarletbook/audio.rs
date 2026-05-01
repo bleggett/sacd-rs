@@ -1,6 +1,6 @@
 use crate::scarletbook::types::FrameFormat;
 use anyhow::Result;
-use log::{trace, debug};
+use log::{debug, trace};
 
 /// SACD audio frame header (first byte of each audio sector)
 #[derive(Debug, Clone, Copy)]
@@ -55,7 +55,9 @@ pub struct AudioFrameInfo {
     pub frames: u8,
     /// Sector count (DST frames only) - number of sectors remaining for this frame
     pub sector_count: u8,
-    /// Channel info
+    /// Per-frame channel-hint bits, mirroring the C reference's
+    /// `channel_bit_1/2/3` packed in byte 3 of the frame info. Used to
+    /// cross-check the area TOC's channel count.
     pub channel_bits: u8,
 }
 
@@ -69,16 +71,33 @@ impl AudioFrameInfo {
             minutes: bytes[0],
             seconds: bytes[1],
             frames: bytes[2],
-            // For little-endian: channel_bit_3 (bit 0), channel_bit_2 (bit 1), sector_count (bits 2-6), channel_bit_1 (bit 7)
-            sector_count: if dst_encoded { (bytes[3] >> 2) & 0x1F } else { 0 },
+            // byte-3 layout (LSB first): channel_bit_3 (bit 0),
+            // channel_bit_2 (bit 1), sector_count (bits 2-6), channel_bit_1 (bit 7).
+            sector_count: if dst_encoded {
+                (bytes[3] >> 2) & 0x1F
+            } else {
+                0
+            },
             channel_bits: if dst_encoded { bytes[3] & 0xE1 } else { 0 },
         }
     }
 
     /// Convert timecode to frame count (matching C code's TIME_FRAMECOUNT macro)
     /// Formula: minutes * 60 * 75 + seconds * 75 + frames
-    pub fn to_frame_count(&self) -> u32 {
+    pub fn to_frame_count(self) -> u32 {
         self.minutes as u32 * 60 * 75 + self.seconds as u32 * 75 + self.frames as u32
+    }
+
+    /// Derive channel count from `channel_bit_2/3`, matching the C
+    /// reference's `get_channel_count(audio_frame_info_t*)`.
+    pub fn derived_channel_count(&self) -> u8 {
+        let bit_3 = self.channel_bits & 0x01;
+        let bit_2 = (self.channel_bits >> 1) & 0x01;
+        match (bit_2, bit_3) {
+            (1, 0) => 6,
+            (0, 1) => 5,
+            _ => 2,
+        }
     }
 }
 
@@ -124,6 +143,12 @@ pub struct AudioSectorParser {
     /// at the moment the frame is returned). Useful to debug filter range
     /// issues without exposing internal state.
     pub last_yielded_timecode: Option<u32>,
+    /// Expected channel count from the area TOC, used to redundantly
+    /// validate the per-frame `channel_bits` hint (see C reference's
+    /// `get_channel_count` cross-check). Optional — set via
+    /// [`AudioSectorParser::set_expected_channel_count`]; if unset, no
+    /// validation is performed.
+    expected_channel_count: Option<u8>,
 }
 
 impl AudioSectorParser {
@@ -142,7 +167,17 @@ impl AudioSectorParser {
             decoded_frames: 0,
             filtered_frames: 0,
             last_yielded_timecode: None,
+            expected_channel_count: None,
         })
+    }
+
+    /// Tell the parser what the area TOC says the channel count should
+    /// be. While set, every frame_info we parse is cross-checked against
+    /// the per-frame `channel_bits` hint (matches the redundancy check
+    /// the C reference performs via `get_channel_count`). Mismatches are
+    /// logged at warn level but do not abort extraction.
+    pub fn set_expected_channel_count(&mut self, n: u8) {
+        self.expected_channel_count = Some(n);
     }
 
     /// Set timecode filter to only extract frames within a specific time range
@@ -162,14 +197,21 @@ impl AudioSectorParser {
         end_seconds: u8,
         end_frames: u8,
     ) {
-        let start_frame_count = start_minutes as u32 * 60 * 75 + start_seconds as u32 * 75 + start_frames as u32;
-        let end_frame_count = end_minutes as u32 * 60 * 75 + end_seconds as u32 * 75 + end_frames as u32;
+        let start_frame_count =
+            start_minutes as u32 * 60 * 75 + start_seconds as u32 * 75 + start_frames as u32;
+        let end_frame_count =
+            end_minutes as u32 * 60 * 75 + end_seconds as u32 * 75 + end_frames as u32;
         self.timecode_filter = Some((start_frame_count, end_frame_count));
         log::info!(
             "Timecode filter set: [{:02}:{:02}:{:02} - {:02}:{:02}:{:02}) = [frame {} - frame {})",
-            start_minutes, start_seconds, start_frames,
-            end_minutes, end_seconds, end_frames,
-            start_frame_count, end_frame_count
+            start_minutes,
+            start_seconds,
+            start_frames,
+            end_minutes,
+            end_seconds,
+            end_frames,
+            start_frame_count,
+            end_frame_count
         );
     }
 
@@ -188,10 +230,15 @@ impl AudioSectorParser {
         }
 
         // Debug: log first sector
-        static SECTOR_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static SECTOR_COUNT: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
         let sector_num = SECTOR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if sector_num < 3 {
-            debug!("[SECTOR #{}] First 16 bytes: {:02x?}", sector_num, &sector_data[..16]);
+            debug!(
+                "[SECTOR #{}] First 16 bytes: {:02x?}",
+                sector_num,
+                &sector_data[..16]
+            );
         }
 
         // Parse audio frame header (first byte)
@@ -216,9 +263,16 @@ impl AudioSectorParser {
 
             // Debug: log first few packets with raw bytes
             if sector_num < 3 && i < 3 {
-                debug!("[PKT_INFO sector={} pkt={}] raw_bytes=[{:02x}, {:02x}], frame_start={}, data_type={}, len={}",
-                         sector_num, i, sector_data[offset], sector_data[offset+1],
-                         packet_info.frame_start, packet_info.data_type, packet_info.packet_length);
+                debug!(
+                    "[PKT_INFO sector={} pkt={}] raw_bytes=[{:02x}, {:02x}], frame_start={}, data_type={}, len={}",
+                    sector_num,
+                    i,
+                    sector_data[offset],
+                    sector_data[offset + 1],
+                    packet_info.frame_start,
+                    packet_info.data_type,
+                    packet_info.packet_length
+                );
             }
 
             packets.push(packet_info);
@@ -234,7 +288,7 @@ impl AudioSectorParser {
             }
             let frame_info = AudioFrameInfo::from_bytes(
                 &sector_data[offset..offset + frame_info_size],
-                header.dst_encoded
+                header.dst_encoded,
             );
             log::debug!(
                 "Frame info [{}]: timecode={}:{}:{}, sector_count={}",
@@ -267,21 +321,47 @@ impl AudioSectorParser {
                 );
             }
 
-            // Only extract audio packets, skip padding and supplementary
-            if packet.data_type == DATA_TYPE_AUDIO {
+            // Mirror the C reference's switch over data_type — recognised
+            // packet types are AUDIO (accumulate) and SUPPLEMENTARY/PADDING
+            // (explicit no-op). Anything else is unknown and we silently
+            // skip it, same as the reference's `default:` arm.
+            match packet.data_type {
+                DATA_TYPE_AUDIO => {}
+                DATA_TYPE_SUPPLEMENTARY | DATA_TYPE_PADDING => {
+                    offset += packet.packet_length as usize;
+                    continue;
+                }
+                _ => {
+                    offset += packet.packet_length as usize;
+                    continue;
+                }
+            }
+
+            {
                 let packet_data = &sector_data[offset..offset + packet.packet_length as usize];
 
-                static PKT_ALL_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                static PKT_ALL_COUNT: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
                 let pkt_all = PKT_ALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if pkt_all < 15 {
-                    debug!("[AUDIO_PKT #{}] frame_start={}, len={}, frame_started={}",
-                             pkt_all, packet.frame_start, packet_data.len(), self.frame_started);
+                    debug!(
+                        "[AUDIO_PKT #{}] frame_start={}, len={}, frame_started={}",
+                        pkt_all,
+                        packet.frame_start,
+                        packet_data.len(),
+                        self.frame_started
+                    );
                 }
 
                 // Debug: log first packet of first few frames
                 if self.frame_started && self.frame_buffer.len() < 20 && packet_data.len() >= 8 {
-                    debug!("[PACKET] Adding packet: offset={}, len={}, first_8_bytes={:02x?}, frame_buf_len_before={}",
-                             offset, packet_data.len(), &packet_data[..8.min(packet_data.len())], self.frame_buffer.len());
+                    debug!(
+                        "[PACKET] Adding packet: offset={}, len={}, first_8_bytes={:02x?}, frame_buf_len_before={}",
+                        offset,
+                        packet_data.len(),
+                        &packet_data[..8.min(packet_data.len())],
+                        self.frame_buffer.len()
+                    );
                 }
 
                 trace!(
@@ -297,6 +377,25 @@ impl AudioSectorParser {
                         if frame_info_idx < frame_infos.len() {
                             let frame_info = &frame_infos[frame_info_idx];
                             frame_info_idx += 1;
+
+                            // Cross-check per-frame channel hint against the
+                            // area TOC, mirroring the C reference's
+                            // `get_channel_count` use. Mismatch is logged
+                            // (warn) but doesn't abort.
+                            if let Some(expected) = self.expected_channel_count {
+                                let derived = frame_info.derived_channel_count();
+                                if derived != expected {
+                                    log::warn!(
+                                        "frame channel hint ({}) disagrees with area TOC \
+                                         channel count ({}) at timecode {:02}:{:02}:{:02}",
+                                        derived,
+                                        expected,
+                                        frame_info.minutes,
+                                        frame_info.seconds,
+                                        frame_info.frames,
+                                    );
+                                }
+                            }
 
                             // If we have a previous frame that's complete, yield it.
                             if self.frame_started
@@ -324,8 +423,7 @@ impl AudioSectorParser {
                                     self.dst_sector_count =
                                         (frame_info.sector_count as i32 - 1).max(0);
                                     self.frame_started = true;
-                                    self.current_frame_timecode =
-                                        Some(frame_info.to_frame_count());
+                                    self.current_frame_timecode = Some(frame_info.to_frame_count());
 
                                     self.total_bytes += raw.len() as u64;
                                     self.decoded_frames += 1;
@@ -346,11 +444,17 @@ impl AudioSectorParser {
                     } else {
                         // Continue accumulating current frame
                         if self.frame_started {
-                            static PKT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-                            let pkt_num = PKT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            static PKT_COUNT: std::sync::atomic::AtomicUsize =
+                                std::sync::atomic::AtomicUsize::new(0);
+                            let pkt_num =
+                                PKT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if pkt_num < 20 {
-                                debug!("[ACCUM_PKT #{}] Adding {} bytes to frame, new total={}",
-                                         pkt_num, packet_data.len(), self.frame_buffer.len() + packet_data.len());
+                                debug!(
+                                    "[ACCUM_PKT #{}] Adding {} bytes to frame, new total={}",
+                                    pkt_num,
+                                    packet_data.len(),
+                                    self.frame_buffer.len() + packet_data.len()
+                                );
                             }
                             self.frame_buffer.extend_from_slice(packet_data);
                         }
@@ -359,8 +463,11 @@ impl AudioSectorParser {
                     // Decrement sector_count after adding each audio packet (matches C code)
                     if self.frame_started && self.dst_sector_count > 0 {
                         self.dst_sector_count -= 1;
-                        log::debug!("After adding packet: buffer_len={}, sector_count={}",
-                            self.frame_buffer.len(), self.dst_sector_count);
+                        log::debug!(
+                            "After adding packet: buffer_len={}, sector_count={}",
+                            self.frame_buffer.len(),
+                            self.dst_sector_count
+                        );
                     }
                 } else {
                     // Uncompressed DSD - just accumulate
@@ -385,10 +492,7 @@ impl AudioSectorParser {
             }
         } else {
             // DST format - check if frame is complete (sector_count reached 0)
-            if self.frame_started
-                && self.dst_sector_count == 0
-                && !self.frame_buffer.is_empty()
-            {
+            if self.frame_started && self.dst_sector_count == 0 && !self.frame_buffer.is_empty() {
                 let should_yield = match self.timecode_filter {
                     Some((s, e)) => self
                         .current_frame_timecode
@@ -559,8 +663,7 @@ mod tests {
         sectors.push(s);
 
         // Drive the parser. Use a wide filter so all three frames are accepted.
-        let mut parser =
-            AudioSectorParser::new(FrameFormat::Dst).expect("parser create");
+        let mut parser = AudioSectorParser::new(FrameFormat::Dst).expect("parser create");
         parser.set_timecode_filter(0, 0, 0, 0, 0, 100); // [0, 100)
 
         let mut produced = 0usize;

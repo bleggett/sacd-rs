@@ -2,16 +2,16 @@ use crate::dst_decoder::decoder::DstDecoder;
 use crate::sacd_reader::SacdReader;
 use crate::scarletbook::area_toc::AreaToc;
 use crate::scarletbook::audio::AudioSectorParser;
-use crate::scarletbook::dsf::{DsfWriter, DSD64_SAMPLE_RATE};
+use crate::scarletbook::dsf::{DSD64_SAMPLE_RATE, DsfWriter};
 use crate::scarletbook::id3::render_id3;
 use crate::scarletbook::master_toc::{MasterText, MasterToc};
 use crate::scarletbook::types::FrameFormat;
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
+use log::debug;
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::path::Path;
-use log::debug;
 
 /// Track extractor for extracting SACD tracks to DSF files
 pub struct TrackExtractor<R: SacdReader> {
@@ -50,9 +50,10 @@ impl<R: SacdReader> TrackExtractor<R> {
 
         // Get track info
         let track_idx = track_number - 1; // Convert to 0-based
-        let track_start_time = area_toc.track_times_start.get(track_idx).ok_or_else(|| {
-            anyhow::anyhow!("Track {} start time not found", track_number)
-        })?;
+        let track_start_time = area_toc
+            .track_times_start
+            .get(track_idx)
+            .ok_or_else(|| anyhow::anyhow!("Track {} start time not found", track_number))?;
         let track_duration = area_toc
             .track_times_duration
             .get(track_idx)
@@ -64,15 +65,12 @@ impl<R: SacdReader> TrackExtractor<R> {
             + track_start_time.frames as u32;
 
         // Get sectors per frame
-        let sectors_per_frame = area_toc
-            .frame_format
-            .sectors_per_frame()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Unsupported or unknown frame format: {:?}",
-                    area_toc.frame_format
-                )
-            })?;
+        let sectors_per_frame = area_toc.frame_format.sectors_per_frame().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Unsupported or unknown frame format: {:?}",
+                area_toc.frame_format
+            )
+        })?;
 
         // Prefer explicit per-track LSN ranges from SACDTRL1; fall back to
         // estimating from timecodes only if the disc didn't include them.
@@ -80,9 +78,7 @@ impl<R: SacdReader> TrackExtractor<R> {
             area_toc.track_start_lsns.get(track_idx).copied(),
             area_toc.track_length_lsns.get(track_idx).copied(),
         ) {
-            (Some(start), Some(length)) if start != 0 && length != 0 => {
-                (start, start + length)
-            }
+            (Some(start), Some(length)) if start != 0 && length != 0 => (start, start + length),
             _ => {
                 let start_lsn = if track_idx == 0 {
                     area_toc.track_start
@@ -90,7 +86,9 @@ impl<R: SacdReader> TrackExtractor<R> {
                     area_toc.track_start + (start_frame * sectors_per_frame / 3)
                 };
                 let end_lsn = if track_idx < area_toc.track_count as usize - 1 {
-                    let next = area_toc.track_times_start.get(track_idx + 1)
+                    let next = area_toc
+                        .track_times_start
+                        .get(track_idx + 1)
                         .ok_or_else(|| anyhow::anyhow!("Next track start time not found"))?;
                     let next_fc = next.minutes as u32 * 60 * 75
                         + next.seconds as u32 * 75
@@ -107,11 +105,19 @@ impl<R: SacdReader> TrackExtractor<R> {
 
         log::info!(
             "Track {}: start_lsn={}, end_lsn={}, total_sectors={}, area.track_start={}, area.track_end={}, channels={}",
-            track_number, start_lsn, end_lsn, total_sectors, area_toc.track_start, area_toc.track_end, area_toc.channel_count
+            track_number,
+            start_lsn,
+            end_lsn,
+            total_sectors,
+            area_toc.track_start,
+            area_toc.track_end,
+            area_toc.channel_count
         );
 
-        debug!("[EXTRACTION] Track {}: channels={}, LSN range: {}-{}, frame_format={:?}",
-                  track_number, area_toc.channel_count, start_lsn, end_lsn, area_toc.frame_format);
+        debug!(
+            "[EXTRACTION] Track {}: channels={}, LSN range: {}-{}, frame_format={:?}",
+            track_number, area_toc.channel_count, start_lsn, end_lsn, area_toc.frame_format
+        );
 
         // Drive the progress bar by output frames written.
         // Total expected frames == track duration in 1/75-second frames
@@ -144,8 +150,10 @@ impl<R: SacdReader> TrackExtractor<R> {
         let id3 = render_id3(master_toc, master_text, area_toc, track_idx);
         dsf_writer.set_id3_footer(id3);
 
-        // Create audio sector parser
+        // Create audio sector parser; tell it the area's channel count so
+        // it can cross-check each frame's per-frame `channel_bits` hint.
         let mut audio_parser = AudioSectorParser::new(area_toc.frame_format)?;
+        audio_parser.set_expected_channel_count(area_toc.channel_count);
 
         // Timecode filter — only frames whose timecode is in
         // [track_start, track_start + track_duration) are decoded. This
@@ -219,12 +227,13 @@ impl<R: SacdReader> TrackExtractor<R> {
                         let off = (i as usize) * SECTOR;
                         let sector = &chunk[off..off + SECTOR];
                         if let Some(raw) = audio_parser.parse_sector(sector)?
-                            && tx.send(raw).is_err() {
-                                // Consumer dropped (almost certainly due to
-                                // a write/decode error). Stop producing —
-                                // the consumer's error will be propagated.
-                                break 'outer;
-                            }
+                            && tx.send(raw).is_err()
+                        {
+                            // Consumer dropped (almost certainly due to
+                            // a write/decode error). Stop producing —
+                            // the consumer's error will be propagated.
+                            break 'outer;
+                        }
                     }
                     current_lsn += want;
                 }
@@ -257,49 +266,49 @@ impl<R: SacdReader> TrackExtractor<R> {
                 }
                 let mut batch: Vec<Vec<u8>> = Vec::with_capacity(BATCH_SIZE);
                 let mut frames_written: u64 = 0;
-                let mut process =
-                    |batch: &mut Vec<Vec<u8>>, dsf_writer: &mut DsfWriter| -> Result<()> {
-                        if batch.is_empty() {
-                            return Ok(());
-                        }
-                        let n = batch.len() as u64;
-                        if is_dst {
-                            // Parallel decode of this batch on the
-                            // per-track pool.
-                            let decoded: Result<Vec<Vec<u8>>> = pool.install(|| {
-                                batch
-                                    .par_iter()
-                                    .map(|raw| -> Result<Vec<u8>> {
-                                        TLS_DECODER.with(|cell| -> Result<Vec<u8>> {
-                                            let mut slot = cell.borrow_mut();
-                                            if slot.is_none() {
-                                                *slot =
-                                                    Some(DstDecoder::new(channels, sample_rate)?);
-                                            }
-                                            let dec = slot.as_mut().unwrap();
-                                            let mut buf = vec![0u8; dec.dsd_frame_bytes()];
-                                            let n = dec.decode_frame(raw, &mut buf)?;
-                                            buf.truncate(n);
-                                            Ok(buf)
-                                        })
+                let mut process = |batch: &mut Vec<Vec<u8>>,
+                                   dsf_writer: &mut DsfWriter|
+                 -> Result<()> {
+                    if batch.is_empty() {
+                        return Ok(());
+                    }
+                    let n = batch.len() as u64;
+                    if is_dst {
+                        // Parallel decode of this batch on the
+                        // per-track pool.
+                        let decoded: Result<Vec<Vec<u8>>> = pool.install(|| {
+                            batch
+                                .par_iter()
+                                .map(|raw| -> Result<Vec<u8>> {
+                                    TLS_DECODER.with(|cell| -> Result<Vec<u8>> {
+                                        let mut slot = cell.borrow_mut();
+                                        if slot.is_none() {
+                                            *slot = Some(DstDecoder::new(channels, sample_rate)?);
+                                        }
+                                        let dec = slot.as_mut().unwrap();
+                                        let mut buf = vec![0u8; dec.dsd_frame_bytes()];
+                                        let n = dec.decode_frame(raw, &mut buf)?;
+                                        buf.truncate(n);
+                                        Ok(buf)
                                     })
-                                    .collect()
-                            });
-                            for f in decoded? {
-                                dsf_writer.write_samples(&f)?;
-                            }
-                        } else {
-                            for raw in batch.iter() {
-                                dsf_writer.write_samples(raw)?;
-                            }
+                                })
+                                .collect()
+                        });
+                        for f in decoded? {
+                            dsf_writer.write_samples(&f)?;
                         }
-                        batch.clear();
-                        frames_written += n;
-                        if let Some(pb) = consumer_pb.as_ref() {
-                            pb.set_position(frames_written);
+                    } else {
+                        for raw in batch.iter() {
+                            dsf_writer.write_samples(raw)?;
                         }
-                        Ok(())
-                    };
+                    }
+                    batch.clear();
+                    frames_written += n;
+                    if let Some(pb) = consumer_pb.as_ref() {
+                        pb.set_position(frames_written);
+                    }
+                    Ok(())
+                };
 
                 for raw in rx.iter() {
                     batch.push(raw);
@@ -320,7 +329,9 @@ impl<R: SacdReader> TrackExtractor<R> {
             let (decoded_n, filtered_n) = producer_res?;
             log::info!(
                 "Track {}: yielded {} frames ({} filtered)",
-                track_num, decoded_n, filtered_n,
+                track_num,
+                decoded_n,
+                filtered_n,
             );
             Ok(())
         })?;
@@ -411,11 +422,6 @@ impl<R: SacdReader> TrackExtractor<R> {
         }
 
         Ok(())
-    }
-
-    /// Get mutable reference to the underlying reader
-    pub fn reader_mut(&mut self) -> &mut R {
-        &mut self.reader
     }
 }
 

@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
+use log::debug;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use log::debug;
 
 use crate::scarletbook::consts::SACD_LSN_SIZE;
 
@@ -86,15 +86,14 @@ impl IsoReader {
 
         // Log first few sectors in the 584-600 range
         if (584..590).contains(&start_lsn) {
-            debug!("[ISO_READ] LSN {}: First 32 bytes: {:02x?}", start_lsn, &buffer[..32.min(buffer.len())]);
+            debug!(
+                "[ISO_READ] LSN {}: First 32 bytes: {:02x?}",
+                start_lsn,
+                &buffer[..32.min(buffer.len())]
+            );
         }
 
         Ok(buffer)
-    }
-
-    /// Read a single sector from the ISO
-    pub fn read_sector(&mut self, lsn: u32) -> Result<Vec<u8>> {
-        self.read_blocks(lsn, 1)
     }
 }
 

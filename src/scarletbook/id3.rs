@@ -100,19 +100,13 @@ pub fn render_id3(
 
     // TIT2 — track title
     let title = track_text
-        .and_then(|t| {
-            t.title
-                .as_deref()
-                .or(t.title_phonetic.as_deref())
-        })
+        .and_then(|t| t.title.as_deref().or(t.title_phonetic.as_deref()))
         .map(|s| s.to_string())
         .unwrap_or_else(|| "no track title".to_string());
     add_text(&mut frames, b"TIT2", &title);
 
     // TALB — album title
-    let album_title = master_text.and_then(|m| {
-        m.album_title.as_deref()
-    });
+    let album_title = master_text.and_then(|m| m.album_title.as_deref());
     if let Some(album) = album_title {
         add_text(&mut frames, b"TALB", album);
     }
@@ -121,10 +115,9 @@ pub fn render_id3(
     // disc_title is present (no album_title), it's used as TALB.
     let disc_title = master_text.and_then(|m| m.disc_title.as_deref());
     match (album_title, disc_title) {
-        (Some(at), Some(dt))
-            if (dt != at || master_toc.album_set_size > 1) => {
-                add_txxx(&mut frames, "DISCSUBTITLE", dt);
-            }
+        (Some(at), Some(dt)) if (dt != at || master_toc.album_set_size > 1) => {
+            add_txxx(&mut frames, "DISCSUBTITLE", dt);
+        }
         (None, Some(dt)) => {
             add_text(&mut frames, b"TALB", dt);
         }
@@ -132,15 +125,10 @@ pub fn render_id3(
     }
 
     // TPE1 — artist (track performer; falls back to disc/album artist).
-    let track_perf = track_text.and_then(|t| {
-        t.performer
-            .as_deref()
-            .or(t.performer_phonetic.as_deref())
-    });
+    let track_perf =
+        track_text.and_then(|t| t.performer.as_deref().or(t.performer_phonetic.as_deref()));
     let artist_for_tpe1: Option<&str> = track_perf.or_else(|| {
-        master_text.and_then(|m| {
-            m.disc_artist.as_deref().or(m.album_artist.as_deref())
-        })
+        master_text.and_then(|m| m.disc_artist.as_deref().or(m.album_artist.as_deref()))
     });
     if let Some(a) = artist_for_tpe1 {
         add_text(&mut frames, b"TPE1", a);
@@ -160,11 +148,9 @@ pub fn render_id3(
     }
 
     // TCOM — composer
-    if let Some(c) = track_text.and_then(|t| {
-        t.composer
-            .as_deref()
-            .or(t.composer_phonetic.as_deref())
-    }) {
+    if let Some(c) =
+        track_text.and_then(|t| t.composer.as_deref().or(t.composer_phonetic.as_deref()))
+    {
         add_text(&mut frames, b"TCOM", c);
     }
 
@@ -189,15 +175,15 @@ pub fn render_id3(
             || isrc.owner_code[0] != 0
             || isrc.recording_year[0] != 0
             || isrc.designation_code[0] != 0)
-        {
-            let s = ascii_concat(&[
-                &isrc.country_code,
-                &isrc.owner_code,
-                &isrc.recording_year,
-                &isrc.designation_code,
-            ]);
-            add_text(&mut frames, b"TSRC", &s);
-        }
+    {
+        let s = ascii_concat(&[
+            &isrc.country_code,
+            &isrc.owner_code,
+            &isrc.recording_year,
+            &isrc.designation_code,
+        ]);
+        add_text(&mut frames, b"TSRC", &s);
+    }
 
     // TPOS — disc number/disc count
     let tpos = format!(
@@ -215,8 +201,20 @@ pub fn render_id3(
         .get(track_idx)
         .filter(|g| g.category == 0x01)
         .copied()
-        .or_else(|| master_toc.disc_genre.iter().find(|g| g.category == 0x01).copied())
-        .or_else(|| master_toc.album_genre.iter().find(|g| g.category == 0x01).copied());
+        .or_else(|| {
+            master_toc
+                .disc_genre
+                .iter()
+                .find(|g| g.category == 0x01)
+                .copied()
+        })
+        .or_else(|| {
+            master_toc
+                .album_genre
+                .iter()
+                .find(|g| g.category == 0x01)
+                .copied()
+        });
     if let Some(g) = genre_entry {
         let idx = g.genre as usize;
         let names = &crate::scarletbook::consts::GENRE_NAMES;
@@ -275,6 +273,9 @@ mod tests {
     #[test]
     fn txxx_payload_format() {
         let p = txxx_payload("KEY", "VAL");
-        assert_eq!(p, vec![0x00, b'K', b'E', b'Y', 0x00, b'V', b'A', b'L', 0x00]);
+        assert_eq!(
+            p,
+            vec![0x00, b'K', b'E', b'Y', 0x00, b'V', b'A', b'L', 0x00]
+        );
     }
 }

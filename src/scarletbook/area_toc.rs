@@ -1,8 +1,8 @@
 use crate::scarletbook::consts;
 use crate::scarletbook::types;
 use anyhow::Result;
-use log::warn;
 use byteorder::{BigEndian, ReadBytesExt};
+use log::warn;
 use std::io::{Cursor, Read};
 
 /// SACD Area Table of Contents
@@ -103,34 +103,6 @@ pub struct AreaToc {
 }
 
 impl AreaToc {
-    /// Parse an Area TOC structure from a reader
-    ///
-    /// # Arguments
-    /// * `reader` - A reader positioned at the start of an Area TOC sector
-    ///
-    /// # Note
-    /// This reads ALL sectors for the area (based on the `size` field) to parse track text.
-    pub fn parse<R: Read>(reader: &mut R) -> Result<Self> {
-        // Read first sector to get the size
-        let mut first_sector = [0u8; consts::SACD_LSN_SIZE];
-        reader.read_exact(&mut first_sector)?;
-
-        let size = u16::from_be_bytes([first_sector[10], first_sector[11]]);
-
-        // Read remaining sectors
-        let additional_bytes = ((size as usize).saturating_sub(1)) * consts::SACD_LSN_SIZE;
-        let mut complete_area_data = Vec::with_capacity(size as usize * consts::SACD_LSN_SIZE);
-        complete_area_data.extend_from_slice(&first_sector);
-
-        if additional_bytes > 0 {
-            let start_len = complete_area_data.len();
-            complete_area_data.resize(start_len + additional_bytes, 0);
-            reader.read_exact(&mut complete_area_data[start_len..])?;
-        }
-
-        Self::from_bytes(&complete_area_data)
-    }
-
     /// Parse from complete area data buffer
     ///
     /// # Arguments
@@ -143,6 +115,14 @@ impl AreaToc {
         let mut reader = Cursor::new(area_data);
         let mut id = [0u8; 8];
         reader.read_exact(&mut id)?;
+        if &id != consts::AREA_TOC_SIGNATURE_STEREO && &id != consts::AREA_TOC_SIGNATURE_MCH {
+            anyhow::bail!(
+                "Area TOC signature mismatch: expected {:?} or {:?}, got {:?}",
+                std::str::from_utf8(consts::AREA_TOC_SIGNATURE_STEREO).unwrap_or("?"),
+                std::str::from_utf8(consts::AREA_TOC_SIGNATURE_MCH).unwrap_or("?"),
+                String::from_utf8_lossy(&id),
+            );
+        }
 
         let version = types::Version::parse(&mut reader)?;
         let size = reader.read_u16::<BigEndian>()?;
@@ -233,8 +213,10 @@ impl AreaToc {
         // Parse track times and ISRC from complete area data
         let (track_times_start, track_times_duration) =
             Self::parse_track_times(area_data, size, track_count)?;
-        let (track_isrc, track_genres) = Self::parse_track_isrc_and_genres(area_data, size, track_count)?;
-        let (track_start_lsns, track_length_lsns) = Self::parse_track_offsets(area_data, size, track_count)?;
+        let (track_isrc, track_genres) =
+            Self::parse_track_isrc_and_genres(area_data, size, track_count)?;
+        let (track_start_lsns, track_length_lsns) =
+            Self::parse_track_offsets(area_data, size, track_count)?;
 
         // Parse area description and copyright strings
         let area_description = if area_description_offset > 0
@@ -313,19 +295,6 @@ impl AreaToc {
         std::str::from_utf8(&self.id).map(|s| s.to_string())
     }
 
-    /// Check if this is a 2-channel area (Scarlet Book definition)
-    /// A 2-channel area has N_Channels=2 and Loudspeaker_Config=0
-    pub fn is_two_channel(&self) -> bool {
-        self.channel_count == 2 && self.loudspeaker_config == 0
-    }
-
-    /// Check if this is a multi-channel area (Scarlet Book definition)
-    /// Per the Scarlet Book spec and reference implementation, a multi-channel area
-    /// is any area that is not a 2-channel area (i.e., not N_Channels=2 with Loudspeaker_Config=0)
-    pub fn is_multi_channel(&self) -> bool {
-        !(self.channel_count == 2 && self.loudspeaker_config == 0)
-    }
-
     /// Parse track text from the raw area data
     ///
     /// This parses the "SACDTTxt" section which contains metadata for each track.
@@ -384,7 +353,7 @@ impl AreaToc {
 
         // Verify signature
         let signature = &area_data[track_text_start..track_text_start + 8];
-        if signature != b"SACDTTxt" {
+        if signature != consts::AREA_TRACK_TEXT_SIGNATURE {
             anyhow::bail!("Invalid track text signature: expected 'SACDTTxt'");
         }
 
@@ -400,7 +369,7 @@ impl AreaToc {
         // Parse track text positions
         let positions_start = track_text_start + 8;
 
-        for track_idx in 0..track_count as usize {
+        for (track_idx, track_text_slot) in track_texts.iter_mut().enumerate() {
             let pos_offset = positions_start + (track_idx * 2);
 
             if pos_offset + 2 > area_data.len() {
@@ -469,7 +438,7 @@ impl AreaToc {
                 let text = String::from_utf8_lossy(string_bytes).to_string();
 
                 // Store in the appropriate field
-                track_texts[track_idx].set_text(text_type, text);
+                track_text_slot.set_text(text_type, text);
 
                 // Skip null terminator
                 ptr += 1;
@@ -507,7 +476,7 @@ impl AreaToc {
         let end_offset = (size as usize) * consts::SACD_LSN_SIZE;
 
         while offset + 8 <= end_offset {
-            if &area_data[offset..offset + 8] == b"SACDTRL2" {
+            if &area_data[offset..offset + 8] == consts::AREA_TRACK_LIST_2_SIGNATURE {
                 // Found track time list
                 let mut reader = Cursor::new(&area_data[offset..]);
 
@@ -566,7 +535,7 @@ impl AreaToc {
         let end_offset = (size as usize) * consts::SACD_LSN_SIZE;
 
         while offset + 8 <= end_offset {
-            if &area_data[offset..offset + 8] == b"SACD_IGL" {
+            if &area_data[offset..offset + 8] == consts::AREA_ISRC_GENRE_SIGNATURE {
                 let mut reader = Cursor::new(&area_data[offset..]);
                 reader.set_position(8);
 
@@ -604,7 +573,7 @@ impl AreaToc {
         let mut offset = consts::SACD_LSN_SIZE;
         let end_offset = (size as usize) * consts::SACD_LSN_SIZE;
         while offset + 8 <= end_offset {
-            if &area_data[offset..offset + 8] == b"SACDTRL1" {
+            if &area_data[offset..offset + 8] == consts::AREA_TRACK_LIST_1_SIGNATURE {
                 let mut reader = Cursor::new(&area_data[offset..]);
                 reader.set_position(8);
                 let mut starts = Vec::with_capacity(track_count as usize);

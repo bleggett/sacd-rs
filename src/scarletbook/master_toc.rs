@@ -4,6 +4,13 @@ use anyhow::Result;
 use byteorder::{BigEndian, ReadBytesExt};
 use std::io::{Cursor, Read};
 
+/// All bytes of the on-disc Master TOC are parsed into named fields. Some
+/// (version, reserved spans, raw dates) are not consumed by the
+/// extraction code paths but remain part of the public struct so callers
+/// inspecting disc metadata have access to them — same rationale as the
+/// C reference's `master_toc_t`, where every member is parsed even if
+/// not used internally.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct MasterToc {
     // M_TOC_0_Header (16 bytes)
@@ -47,6 +54,13 @@ impl MasterToc {
     pub fn read_from<R: Read>(reader: &mut R) -> Result<Self> {
         let mut id = [0u8; 8];
         reader.read_exact(&mut id)?;
+        if &id != consts::MASTER_TOC_SIGNATURE {
+            anyhow::bail!(
+                "Master TOC signature mismatch: expected {:?}, got {:?} — not a Scarlet Book disc",
+                std::str::from_utf8(consts::MASTER_TOC_SIGNATURE).unwrap_or("?"),
+                String::from_utf8_lossy(&id),
+            );
+        }
 
         let version = types::Version::parse(reader)?;
 
@@ -149,24 +163,6 @@ impl MasterToc {
         })
     }
 
-    /// Validate that this is a valid Master TOC
-    pub fn is_valid(&self) -> bool {
-        &self.id == consts::MASTER_TOC_SIGNATURE
-    }
-
-    /// Get ID as string
-    pub fn id_string(&self) -> String {
-        String::from_utf8_lossy(&self.id).to_string()
-    }
-
-    /// Get album catalog number as string (trimmed)
-    pub fn album_catalog(&self) -> String {
-        String::from_utf8_lossy(&self.album_catalog_number)
-            .trim_end_matches('\0')
-            .trim()
-            .to_string()
-    }
-
     /// Get disc catalog number as string (trimmed)
     pub fn disc_catalog(&self) -> String {
         String::from_utf8_lossy(&self.disc_catalog_number)
@@ -188,15 +184,6 @@ impl MasterToc {
     /// Has multi-channel area
     pub fn has_multi_channel(&self) -> bool {
         self.area_2_toc_1_start != 0
-    }
-
-    /// Get language code for a locale index
-    pub fn get_language(&self, index: usize) -> Option<String> {
-        if index < self.text_area_count as usize {
-            String::from_utf8(self.locales[index].language_code.to_vec()).ok()
-        } else {
-            None
-        }
     }
 
     /// Get disc category (from first genre table entry with category=1)
@@ -239,7 +226,7 @@ impl MasterText {
         // Read and verify ID
         let mut id = [0u8; 8];
         cursor.read_exact(&mut id)?;
-        if &id != b"SACDText" {
+        if &id != consts::MASTER_TEXT_SIGNATURE {
             anyhow::bail!("Invalid master text signature");
         }
 

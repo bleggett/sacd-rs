@@ -14,12 +14,15 @@ const FMT_CHUNK_SIZE: u64 = 52;
 /// Sample rate for DSD64 (2.8224 MHz)
 pub const DSD64_SAMPLE_RATE: u32 = 2822400;
 
-/// DSF file writer for SACD audio extraction
+/// DSF file writer for SACD audio extraction. Note that `sample_rate` and
+/// the up-front `total_samples_per_channel` parameters are written into
+/// the fmt chunk during `create()` but not retained on the struct: the
+/// final `sample_count` is patched in `finalize()` from the actual decoded
+/// byte total (the C reference does the same via `handle->sample_count /
+/// channel_count * 8`).
 pub struct DsfWriter {
     writer: BufWriter<File>,
     channel_count: u32,
-    sample_rate: u32,
-    total_samples_per_channel: u64,
     data_chunk_offset: u64,
     bytes_written: u64,
     /// Total decoded sample bytes received via `write_samples` BEFORE block
@@ -104,8 +107,6 @@ impl DsfWriter {
         Ok(Self {
             writer,
             channel_count,
-            sample_rate,
-            total_samples_per_channel,
             data_chunk_offset,
             bytes_written: 0,
             decoded_bytes_total: 0,
@@ -161,34 +162,7 @@ impl DsfWriter {
         Ok(())
     }
 
-    /// Write non-interleaved DSD audio samples (one channel at a time)
-    ///
-    /// This method buffers data for each channel and writes complete 4096-byte blocks
-    /// when all channels have data. Use this when you receive data one channel at a time.
-    ///
-    /// # Arguments
-    /// * `channel` - Channel index (0-based)
-    /// * `data` - Audio data for this channel
-    pub fn write_channel_samples(&mut self, channel: usize, data: &[u8]) -> Result<()> {
-        if channel >= self.channel_count as usize {
-            anyhow::bail!(
-                "Invalid channel index {} (max {})",
-                channel,
-                self.channel_count - 1
-            );
-        }
-
-        self.channel_buffers[channel].extend_from_slice(data);
-
-        // When all channels have at least 4096 bytes, write a complete block
-        while self.channel_buffers.iter().all(|buf| buf.len() >= 4096) {
-            self.flush_channel_block()?;
-        }
-
-        Ok(())
-    }
-
-    /// Flush one 4096-byte block from all channel buffers (no longer used with new approach)
+    /// Flush one 4096-byte block from all channel buffers (used by finalize()).
     fn flush_channel_block(&mut self) -> Result<()> {
         // With the new round-robin approach, we flush individual channels as they fill
         // This function is kept for the finalize() method
@@ -251,24 +225,11 @@ impl DsfWriter {
         self.writer.flush()?;
         Ok(())
     }
-
-    /// Get the number of channels in this DSF file
-    pub fn channel_count(&self) -> u32 {
-        self.channel_count
-    }
-
-    /// Get the sample rate in Hz
-    pub fn sample_rate(&self) -> u32 {
-        self.sample_rate
-    }
 }
 
-/// Reverse bits in a byte (convert MSB-first to LSB-first)
+/// Reverse bits in a byte (convert MSB-first to LSB-first).
 ///
 /// SACD audio data uses MSB-first bit order, but DSF format requires LSB-first.
-/// This function reverses the bit order within each byte.
-///
-/// Example: 0b10110010 -> 0b01001101
 #[inline]
 pub fn reverse_bits(byte: u8) -> u8 {
     let mut result = byte;
@@ -276,13 +237,6 @@ pub fn reverse_bits(byte: u8) -> u8 {
     result = (result & 0xCC) >> 2 | (result & 0x33) << 2;
     result = (result & 0xAA) >> 1 | (result & 0x55) << 1;
     result
-}
-
-/// Reverse bits in a slice of bytes (in-place)
-pub fn reverse_bits_inplace(data: &mut [u8]) {
-    for byte in data.iter_mut() {
-        *byte = reverse_bits(*byte);
-    }
 }
 
 #[cfg(test)]
@@ -297,12 +251,5 @@ mod tests {
         assert_eq!(reverse_bits(0b00000001), 0b10000000);
         assert_eq!(reverse_bits(0b10110010), 0b01001101);
         assert_eq!(reverse_bits(0b11001010), 0b01010011);
-    }
-
-    #[test]
-    fn test_reverse_bits_inplace() {
-        let mut data = vec![0b10110010, 0b11001010, 0b00000001];
-        reverse_bits_inplace(&mut data);
-        assert_eq!(data, vec![0b01001101, 0b01010011, 0b10000000]);
     }
 }

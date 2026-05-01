@@ -5,9 +5,9 @@ use std::fs;
 use std::net::IpAddr;
 use std::path::PathBuf;
 
+mod dst_decoder;
 mod sacd_reader;
 mod scarletbook;
-mod dst_decoder;
 
 use sacd_reader::IsoReader;
 use sacd_reader::NetReader;

@@ -1,7 +1,7 @@
-/// Integration test to verify bit-perfect extraction against C reference
-///
-/// This test extracts track 1 from the test ISO and compares the output
-/// byte-for-byte with a known-good reference file extracted by the C tool.
+//! Integration test to verify bit-perfect extraction against C reference.
+//!
+//! This test extracts track 1 from the test ISO and compares the output
+//! byte-for-byte with a known-good reference file extracted by the C tool.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -29,11 +29,13 @@ fn test_bit_perfect_extraction() {
     // Extract with our tool
     let output_dir = tempfile::tempdir().unwrap();
     let status = Command::new(env!("CARGO_BIN_EXE_sacd-rs"))
-        .args(&[
+        .args([
             "extract",
-            "--iso", test_iso_path.to_str().unwrap(),
+            "--iso",
+            test_iso_path.to_str().unwrap(),
             output_dir.path().to_str().unwrap(),
-            "-t", "1",
+            "-t",
+            "1",
             "--stereo",
         ])
         .status()
@@ -69,8 +71,7 @@ fn test_bit_perfect_extraction() {
         extracted_data.iter().zip(reference_data.iter()).enumerate()
     {
         assert_eq!(
-            extracted_byte,
-            reference_byte,
+            extracted_byte, reference_byte,
             "Mismatch at byte offset {:#x}: extracted={:#04x}, reference={:#04x}",
             i, extracted_byte, reference_byte
         );
@@ -96,7 +97,10 @@ fn test_dsd_silence_pattern() {
 
     // After reversal (DSF format), it should be 0x99
     let reversed = byte.reverse_bits();
-    println!("Byte after reversal: {:#04x} (binary: {:08b})", reversed, reversed);
+    println!(
+        "Byte after reversal: {:#04x} (binary: {:08b})",
+        reversed, reversed
+    );
 
     assert_eq!(reversed, 0x99, "Reversed byte should be DSD silence 0x99");
 }
