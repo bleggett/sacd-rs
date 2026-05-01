@@ -6,12 +6,15 @@
 // MPEG-4 Audio RM Module - Lossless coding of 1-bit oversampled audio
 // ISO/IEC 14496-3:2001/Amd 6:2005
 
-use crate::scarletbook::consts::{DSD64_SAMPLE_RATE, DSD128_SAMPLE_RATE, DSD256_SAMPLE_RATE};
 use anyhow::{Result, bail};
 
 // ============================================================================
 // CONSTANTS — match conststr.h
 // ============================================================================
+
+const DSD64_SAMPLE_RATE: u32 = 2_822_400;
+const DSD128_SAMPLE_RATE: u32 = 5_644_800;
+const DSD256_SAMPLE_RATE: u32 = 11_289_600;
 
 const RESOL: i64 = 8;
 
@@ -1386,10 +1389,6 @@ mod tests {
     // committed binary blobs; their reference DSD outputs were verified
     // against the C `sacd-ripper` decoder via byte-for-byte file comparison
     // before being baked in.
-
-    use crate::scarletbook::consts::{
-        DSD64_SAMPLE_RATE, DSD128_SAMPLE_RATE, DSD256_SAMPLE_RATE,
-    };
 
     macro_rules! stereo_fixture {
         ($n:literal) => {
