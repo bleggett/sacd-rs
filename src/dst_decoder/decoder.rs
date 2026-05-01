@@ -412,10 +412,17 @@ pub struct DstDecoder {
     /// AData buffer: one bit per byte (0 or 1).
     a_data: Vec<u8>,
     a_data_len: i32,
-    /// Filter4Bit[ChNr][BitNr], filled per-frame.
-    filter4_bit: Vec<Vec<u8>>,
-    /// Ptable4Bit[ChNr][BitNr], filled per-frame.
-    ptable4_bit: Vec<Vec<u8>>,
+    /// Filter4Bit, flat row-major as `[ch * bits_per_ch_stride + bit]`,
+    /// filled per-frame. One allocation instead of `MAX_CHANNELS` separate
+    /// heap blocks for cache locality and to drop the inner-Vec metadata
+    /// from the hot path.
+    filter4_bit: Vec<u8>,
+    /// Ptable4Bit, flat row-major; same layout as `filter4_bit`.
+    ptable4_bit: Vec<u8>,
+    /// Per-channel row stride for `filter4_bit` / `ptable4_bit`. Equals
+    /// `nr_of_bits_per_ch` and is constant for the decoder's lifetime
+    /// (derived from the sample rate at construction).
+    bits_per_ch_stride: usize,
     channel_count: usize,
     /// Whether the current CPU advertises AVX2; cached at construction so
     /// the per-bit FIR dispatch is one predicted branch instead of a
@@ -459,8 +466,9 @@ impl DstDecoder {
             p_one: vec![[0; AC_HISMAX]; max_nr_of_ptables],
             a_data: Vec::new(),
             a_data_len: 0,
-            filter4_bit: vec![vec![0u8; nr_of_bits_per_ch as usize]; MAX_CHANNELS],
-            ptable4_bit: vec![vec![0u8; nr_of_bits_per_ch as usize]; MAX_CHANNELS],
+            filter4_bit: vec![0u8; (nr_of_bits_per_ch as usize) * MAX_CHANNELS],
+            ptable4_bit: vec![0u8; (nr_of_bits_per_ch as usize) * MAX_CHANNELS],
+            bits_per_ch_stride: nr_of_bits_per_ch as usize,
             channel_count,
             #[cfg(target_arch = "x86_64")]
             has_avx2: std::is_x86_feature_detected!("avx2"),
@@ -1001,22 +1009,24 @@ impl DstDecoder {
         nr_of_channels: usize,
         nr_of_bits_per_ch: usize,
         s: &Segment,
-        table_4bit: &mut [Vec<u8>],
+        table_4bit: &mut [u8],
     ) {
-        for (ch, dst) in table_4bit.iter_mut().take(nr_of_channels).enumerate() {
+        for ch in 0..nr_of_channels {
+            let row_start = ch * nr_of_bits_per_ch;
+            let row = &mut table_4bit[row_start..row_start + nr_of_bits_per_ch];
             let mut start = 0usize;
             let mut last_seg = 0usize;
             let n = s.nr_of_segments[ch] as usize;
             for seg in 0..n.saturating_sub(1) {
                 let val = s.table4_segment[ch][seg] as u8;
                 let end = start + (s.resolution as usize) * 8 * (s.segment_len[ch][seg] as usize);
-                dst[start..end].fill(val);
+                row[start..end].fill(val);
                 start = end;
                 last_seg = seg + 1;
             }
             // Final segment fills the rest.
             let val = s.table4_segment[ch][last_seg] as u8;
-            dst[start..nr_of_bits_per_ch].fill(val);
+            row[start..].fill(val);
         }
     }
 
@@ -1094,13 +1104,15 @@ impl DstDecoder {
         let a_data_len: i32 = self.a_data_len;
         let filter4_bit = &self.filter4_bit[..];
         let ptable4_bit = &self.ptable4_bit[..];
+        let stride = self.bits_per_ch_stride;
         let has_avx2 = self.has_avx2;
 
         for bit_nr in 0..nr_of_bits_per_ch {
             let byte_nr = bit_nr / 8;
             let bit_shift = 7 - (bit_nr % 8);
             for ch_nr in 0..nr_of_channels {
-                let filter_idx = filter4_bit[ch_nr][bit_nr] as usize;
+                let row_off = ch_nr * stride + bit_nr;
+                let filter_idx = filter4_bit[row_off] as usize;
                 let ftable = &i_coef_i[filter_idx];
                 let st = &mut status[ch_nr];
 
@@ -1134,7 +1146,7 @@ impl DstDecoder {
                 {
                     ac.decode_bit(AC_PROBS / 2, a_data, a_data_len)
                 } else {
-                    let ptable_idx = ptable4_bit[ch_nr][bit_nr] as usize;
+                    let ptable_idx = ptable4_bit[row_off] as usize;
                     let plen = ptable_len[ptable_idx];
                     let entry = ac_get_ptable_index(predict, plen) as usize;
                     let prob = p_one[ptable_idx][entry];
