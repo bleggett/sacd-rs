@@ -117,8 +117,14 @@ impl<R: SacdReader> TrackExtractor<R> {
         debug!("[EXTRACTION] Track {}: channels={}, LSN range: {}-{}, frame_format={:?}",
                   track_number, area_toc.channel_count, start_lsn, end_lsn, area_toc.frame_format);
 
+        // Drive the progress bar by output frames written.
+        // Total expected frames == track duration in 1/75-second frames
+        // (already computed as `dur_fc` below).
         if let Some(pb) = progress_bar {
-            pb.set_length(total_sectors as u64);
+            let total_frames = track_duration.minutes as u64 * 60 * 75
+                + track_duration.seconds as u64 * 75
+                + track_duration.frames as u64;
+            pb.set_length(total_frames);
             pb.set_message(format!("Track {}", track_number));
         }
 
@@ -129,7 +135,6 @@ impl<R: SacdReader> TrackExtractor<R> {
             + track_duration.frames as u64 / 75;
         let total_samples_per_channel = duration_seconds * DSD64_SAMPLE_RATE as u64;
 
-        // Create DSF writer
         let mut dsf_writer = DsfWriter::create(
             output_path,
             area_toc.channel_count as u32,
@@ -197,7 +202,6 @@ impl<R: SacdReader> TrackExtractor<R> {
         let channels = area_toc.channel_count as usize;
         let sample_rate = DSD64_SAMPLE_RATE as usize;
         let track_num = track_number;
-        let pb_owned = progress_bar.cloned();
 
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(CHANNEL_CAPACITY);
         let reader: &mut R = &mut self.reader;
@@ -206,7 +210,6 @@ impl<R: SacdReader> TrackExtractor<R> {
             // ---- Producer ----
             let producer = s.spawn(move || -> Result<(u64, u64)> {
                 let mut current_lsn = start_lsn;
-                let mut sectors_processed = 0u32;
                 'outer: while current_lsn < end_lsn {
                     let want = (end_lsn - current_lsn).min(BATCH_SECTORS);
                     let chunk = reader
@@ -233,10 +236,6 @@ impl<R: SacdReader> TrackExtractor<R> {
                         }
                     }
                     current_lsn += want;
-                    sectors_processed += want;
-                    if let Some(pb) = pb_owned.as_ref() {
-                        pb.set_position(sectors_processed as u64);
-                    }
                 }
                 if let Some(raw) = audio_parser.flush() {
                     let _ = tx.send(raw);
@@ -249,6 +248,7 @@ impl<R: SacdReader> TrackExtractor<R> {
             // Run the consumer in an inner scope so `rx` is dropped when it
             // returns (including via `?`). Dropping `rx` unblocks any
             // producer waiting on a full channel after a consumer error.
+            let consumer_pb = progress_bar.cloned();
             let consumer_res = (|rx: std::sync::mpsc::Receiver<Vec<u8>>| -> Result<()> {
                 thread_local! {
                     static TLS_DECODER: RefCell<Option<DstDecoder>> = const {
@@ -256,11 +256,13 @@ impl<R: SacdReader> TrackExtractor<R> {
                     };
                 }
                 let mut batch: Vec<Vec<u8>> = Vec::with_capacity(BATCH_SIZE);
-                let process =
+                let mut frames_written: u64 = 0;
+                let mut process =
                     |batch: &mut Vec<Vec<u8>>, dsf_writer: &mut DsfWriter| -> Result<()> {
                         if batch.is_empty() {
                             return Ok(());
                         }
+                        let n = batch.len() as u64;
                         if is_dst {
                             // Parallel decode of this batch.
                             let decoded: Result<Vec<Vec<u8>>> = batch
@@ -288,6 +290,10 @@ impl<R: SacdReader> TrackExtractor<R> {
                             }
                         }
                         batch.clear();
+                        frames_written += n;
+                        if let Some(pb) = consumer_pb.as_ref() {
+                            pb.set_position(frames_written);
+                        }
                         Ok(())
                     };
 
