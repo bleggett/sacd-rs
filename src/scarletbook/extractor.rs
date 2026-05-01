@@ -13,7 +13,6 @@ use log::debug;
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 
 /// Producer-thread instrumentation, returned via `JoinHandle::join`.
 struct ProducerStats {
@@ -259,14 +258,6 @@ impl<R: SacdReader> TrackExtractor<R> {
         let writer_pb = progress_bar.cloned();
         let dsf_writer_for_thread = dsf_writer;
 
-        // Decoder workers pop a buffer (allocating fresh if empty); writer
-        // recycles each batch back after writing. Steady-state in-flight
-        // working set is ~one batch's worth of buffers.
-        let buffer_pool: Arc<Mutex<Vec<Vec<u8>>>> =
-            Arc::new(Mutex::new(Vec::with_capacity(BATCH_SIZE * 2)));
-        let pool_for_decoder = Arc::clone(&buffer_pool);
-        let pool_for_writer = Arc::clone(&buffer_pool);
-
         let pipeline_start = std::time::Instant::now();
 
         let carry_out = std::thread::scope(|s| -> Result<Option<NopadCarry>> {
@@ -350,11 +341,7 @@ impl<R: SacdReader> TrackExtractor<R> {
                     if let Some(pb) = writer_pb.as_ref() {
                         pb.set_position(frames);
                     }
-                    // Recycle this batch's buffers back into the shared pool.
-                    // Single lock per batch keeps contention with decoder
-                    // workers low.
-                    let mut pool = pool_for_writer.lock().unwrap();
-                    pool.extend(batch);
+                    drop(batch);
                 }
                 Ok((
                     dsf_writer,
@@ -405,7 +392,6 @@ impl<R: SacdReader> TrackExtractor<R> {
                     }
                     let decoded: Vec<Vec<u8>> = if is_dst {
                         let t_dec = Instant::now();
-                        let buffer_pool = &pool_for_decoder;
                         let res: Result<Vec<Vec<u8>>> = pool.install(|| {
                             batch
                                 .par_iter()
@@ -417,19 +403,7 @@ impl<R: SacdReader> TrackExtractor<R> {
                                         }
                                         let dec = slot.as_mut().unwrap();
                                         let needed = dec.dsd_frame_bytes();
-                                        // Reuse a buffer from the writer's
-                                        // recycle pool when available, else
-                                        // allocate. Either way the buffer
-                                        // is sized to `needed`; decode_frame
-                                        // re-zeros what it needs internally.
-                                        let mut buf = buffer_pool
-                                            .lock()
-                                            .unwrap()
-                                            .pop()
-                                            .unwrap_or_else(|| Vec::with_capacity(needed));
-                                        if buf.len() != needed {
-                                            buf.resize(needed, 0);
-                                        }
+                                        let mut buf = vec![0u8; needed];
                                         let n = dec.decode_frame(raw, &mut buf)?;
                                         debug_assert_eq!(n, needed);
                                         Ok(buf)
