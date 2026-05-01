@@ -1377,4 +1377,167 @@ mod tests {
         let mut r = BitReader::new(&data);
         assert_eq!(r.read_int(9).unwrap(), -27);
     }
+
+    // BEGIN public-API tests
+    //
+    // These tests exercise every public surface of the dst_decoder module
+    // with both synthetic inputs (config edges) and real DST frames snipped
+    // from a SACD ISO. The fixture files under `test_fixtures/` are
+    // committed binary blobs; their reference DSD outputs were verified
+    // against the C `sacd-ripper` decoder via byte-for-byte file comparison
+    // before being baked in.
+
+    use crate::scarletbook::consts::{
+        DSD64_SAMPLE_RATE, DSD128_SAMPLE_RATE, DSD256_SAMPLE_RATE,
+    };
+
+    macro_rules! stereo_fixture {
+        ($n:literal) => {
+            (
+                include_bytes!(concat!("test_fixtures/stereo/frame_", $n, ".dst")) as &[u8],
+                include_bytes!(concat!("test_fixtures/stereo/frame_", $n, ".dsd")) as &[u8],
+            )
+        };
+    }
+    macro_rules! mch_fixture {
+        ($n:literal) => {
+            (
+                include_bytes!(concat!("test_fixtures/mch/frame_", $n, ".dst")) as &[u8],
+                include_bytes!(concat!("test_fixtures/mch/frame_", $n, ".dsd")) as &[u8],
+            )
+        };
+    }
+
+    #[test]
+    fn new_accepts_all_supported_sample_rates() {
+        for &rate in &[DSD64_SAMPLE_RATE, DSD128_SAMPLE_RATE, DSD256_SAMPLE_RATE] {
+            DstDecoder::new(2, rate as usize)
+                .unwrap_or_else(|e| panic!("DSD@{} should be accepted: {}", rate, e));
+        }
+    }
+
+    #[test]
+    fn new_rejects_zero_and_too_many_channels() {
+        assert!(DstDecoder::new(0, DSD64_SAMPLE_RATE as usize).is_err());
+        assert!(DstDecoder::new(MAX_CHANNELS + 1, DSD64_SAMPLE_RATE as usize).is_err());
+    }
+
+    #[test]
+    fn new_rejects_unsupported_sample_rate() {
+        assert!(DstDecoder::new(2, 48_000).is_err());
+        assert!(DstDecoder::new(2, 44_100).is_err());
+        assert!(DstDecoder::new(2, 0).is_err());
+    }
+
+    #[test]
+    fn dsd_frame_bytes_matches_588_times_fs_over_8_times_channels() {
+        // Spec: max_frame_len = 588 * Fs44 / 8 bytes per channel; total
+        // frame bytes = max_frame_len * nr_of_channels.
+        let cases = [
+            (2, DSD64_SAMPLE_RATE as usize, 588 * 64 / 8 * 2),
+            (5, DSD64_SAMPLE_RATE as usize, 588 * 64 / 8 * 5),
+            (6, DSD64_SAMPLE_RATE as usize, 588 * 64 / 8 * 6),
+            (2, DSD128_SAMPLE_RATE as usize, 588 * 128 / 8 * 2),
+            (2, DSD256_SAMPLE_RATE as usize, 588 * 256 / 8 * 2),
+        ];
+        for (ch, rate, expected) in cases {
+            let d = DstDecoder::new(ch, rate).unwrap();
+            assert_eq!(
+                d.dsd_frame_bytes(),
+                expected,
+                "channels={} rate={}",
+                ch,
+                rate
+            );
+        }
+    }
+
+    #[test]
+    fn decode_frame_stereo_first_frame_bit_exact() {
+        let (dst, dsd_ref) = stereo_fixture!("001");
+        let mut decoder = DstDecoder::new(2, DSD64_SAMPLE_RATE as usize).unwrap();
+        let mut out = vec![0u8; decoder.dsd_frame_bytes()];
+        let n = decoder.decode_frame(dst, &mut out).unwrap();
+        assert_eq!(n, decoder.dsd_frame_bytes());
+        assert_eq!(out, dsd_ref);
+    }
+
+    #[test]
+    fn decode_frame_stereo_sequence_is_per_frame_stateless() {
+        // A single decoder instance must produce identical output for each
+        // fixture frame as a freshly-constructed decoder would; this is
+        // the property that lets the production pipeline parallelise via
+        // rayon thread-local decoders.
+        let frames = [
+            stereo_fixture!("001"),
+            stereo_fixture!("002"),
+            stereo_fixture!("003"),
+        ];
+        let mut shared = DstDecoder::new(2, DSD64_SAMPLE_RATE as usize).unwrap();
+        let dsd_len = shared.dsd_frame_bytes();
+        let mut out = vec![0u8; dsd_len];
+
+        for (i, (dst, dsd_ref)) in frames.iter().enumerate() {
+            out.fill(0);
+            let n = shared.decode_frame(dst, &mut out).unwrap();
+            assert_eq!(n, dsd_len, "frame {} returned wrong length", i + 1);
+            assert_eq!(&out, dsd_ref, "shared decoder mismatch on frame {}", i + 1);
+
+            let mut fresh = DstDecoder::new(2, DSD64_SAMPLE_RATE as usize).unwrap();
+            let mut fresh_out = vec![0u8; dsd_len];
+            fresh.decode_frame(dst, &mut fresh_out).unwrap();
+            assert_eq!(&fresh_out, dsd_ref, "fresh decoder mismatch on frame {}", i + 1);
+        }
+    }
+
+    #[test]
+    fn decode_frame_mch_sequence_bit_exact() {
+        let frames = [
+            mch_fixture!("001"),
+            mch_fixture!("002"),
+            mch_fixture!("003"),
+        ];
+        let channels = 5;
+        let mut decoder = DstDecoder::new(channels, DSD64_SAMPLE_RATE as usize).unwrap();
+        let dsd_len = decoder.dsd_frame_bytes();
+        let mut out = vec![0u8; dsd_len];
+
+        for (i, (dst, dsd_ref)) in frames.iter().enumerate() {
+            assert_eq!(dsd_ref.len(), dsd_len);
+            out.fill(0);
+            let n = decoder.decode_frame(dst, &mut out).unwrap();
+            assert_eq!(n, dsd_len);
+            assert_eq!(&out, dsd_ref, "mch frame {} mismatch", i + 1);
+        }
+    }
+
+    #[test]
+    fn decode_frame_rejects_undersized_output_buffer() {
+        let (dst, _) = stereo_fixture!("001");
+        let mut decoder = DstDecoder::new(2, DSD64_SAMPLE_RATE as usize).unwrap();
+        let mut tiny = vec![0u8; decoder.dsd_frame_bytes() - 1];
+        let err = decoder.decode_frame(dst, &mut tiny).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("DSD output buffer too small"),
+            "unexpected error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn decode_frame_accepts_oversized_output_buffer() {
+        // A larger-than-needed output buffer is fine: decode_frame writes
+        // exactly dsd_frame_bytes() and reports that count; the trailing
+        // bytes are left untouched.
+        let (dst, dsd_ref) = stereo_fixture!("001");
+        let mut decoder = DstDecoder::new(2, DSD64_SAMPLE_RATE as usize).unwrap();
+        let dsd_len = decoder.dsd_frame_bytes();
+        let mut out = vec![0xAAu8; dsd_len + 64];
+        let n = decoder.decode_frame(dst, &mut out).unwrap();
+        assert_eq!(n, dsd_len);
+        assert_eq!(&out[..dsd_len], dsd_ref);
+        assert!(out[dsd_len..].iter().all(|&b| b == 0xAA));
+    }
+    // END public-API tests
 }
