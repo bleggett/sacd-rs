@@ -1,5 +1,4 @@
 use crate::scarletbook::types::FrameFormat;
-use crate::dst_decoder::decoder::DstDecoder;
 use anyhow::Result;
 use log::{trace, debug};
 
@@ -88,56 +87,66 @@ const DATA_TYPE_AUDIO: u8 = 2;
 const DATA_TYPE_SUPPLEMENTARY: u8 = 3;
 const DATA_TYPE_PADDING: u8 = 7;
 
-/// Audio sector parser for extracting DSD samples from SACD audio sectors
+/// Audio sector parser. Walks SACD audio sectors and yields one
+/// **raw** frame at a time:
+///
+/// * For DST-compressed areas, the yielded bytes are the raw DST frame
+///   payload (the bytes that get fed into `DstDecoder::decode_frame`).
+///   The caller is responsible for decoding — this lets the caller
+///   batch frames and decode them in parallel.
+/// * For uncompressed DSD areas, the yielded bytes are the audio data
+///   directly, in chunks of at least `CHUNK_SIZE`.
+///
+/// `decoded_frames` and `filtered_frames` are kept as field names for
+/// continuity, but for DST they count "frames yielded" / "frames
+/// filtered out" — actual decoding happens elsewhere.
 pub struct AudioSectorParser {
     /// Frame format (DST, DSD 3-in-14, DSD 3-in-16, etc.)
     frame_format: FrameFormat,
-    /// Accumulated audio data for the current frame
+    /// Accumulated audio data for the current frame.
     frame_buffer: Vec<u8>,
-    /// Total bytes extracted
+    /// Total bytes yielded.
     total_bytes: u64,
-    /// DST decoder (only used for DST-compressed audio)
-    dst_decoder: Option<DstDecoder>,
-    /// Decode counters (debug aid).
+    /// Frames yielded for downstream decoding (DST) or written directly (DSD).
     pub decoded_frames: u64,
+    /// Frames dropped because they fell outside the timecode filter.
     pub filtered_frames: u64,
-    /// Remaining sector count for current DST frame
+    /// Remaining sector count for current DST frame.
     dst_sector_count: i32,
-    /// Frame has started
+    /// Frame has started.
     frame_started: bool,
-    /// Optional timecode filtering (start frame count, end frame count)
-    /// When set, only frames with timecodes in [start, end) range are extracted
+    /// Optional timecode filtering (start frame count, end frame count).
+    /// When set, only frames with timecodes in [start, end) range are emitted.
     timecode_filter: Option<(u32, u32)>,
-    /// Current frame's timecode (as frame count) for filtering
+    /// Current frame's timecode (as frame count) for filtering.
     current_frame_timecode: Option<u32>,
+    /// Timecode of the last yielded DST frame (set on `parse_sector`/`flush`
+    /// at the moment the frame is returned). Useful to debug filter range
+    /// issues without exposing internal state.
+    pub last_yielded_timecode: Option<u32>,
 }
 
 impl AudioSectorParser {
-    /// Create a new audio sector parser
-    ///
-    /// # Arguments
-    /// * `frame_format` - The frame format (DST, DSD, etc.)
-    /// * `channel_count` - Number of audio channels
-    /// * `sample_rate` - Sample rate in Hz
-    pub fn new(frame_format: FrameFormat, channel_count: usize, sample_rate: usize) -> Result<Self> {
-        // Initialize DST decoder if needed
-        let dst_decoder = if matches!(frame_format, FrameFormat::Dst) {
-            Some(DstDecoder::new(channel_count, sample_rate)?)
-        } else {
-            None
-        };
-
+    /// Create a new audio sector parser. The `channel_count` and
+    /// `sample_rate` parameters are accepted for forward compatibility but
+    /// are not used: this parser only demuxes sectors into raw frame bytes
+    /// and never decodes.
+    pub fn new(
+        frame_format: FrameFormat,
+        _channel_count: usize,
+        _sample_rate: usize,
+    ) -> Result<Self> {
         Ok(Self {
             frame_format,
             frame_buffer: Vec::new(),
             total_bytes: 0,
-            dst_decoder,
             dst_sector_count: 0,
             frame_started: false,
             timecode_filter: None,
             current_frame_timecode: None,
             decoded_frames: 0,
             filtered_frames: 0,
+            last_yielded_timecode: None,
         })
     }
 
@@ -289,102 +298,52 @@ impl AudioSectorParser {
 
                 // Handle DST-compressed audio
                 if matches!(self.frame_format, FrameFormat::Dst) {
-                    // If this packet marks a new frame start
                     if packet.frame_start {
-                        debug!("[FRAME_START_FLAG] packet.frame_start=true, packet_len={}, frame_info_idx={}",
-                                 packet_data.len(), frame_info_idx);
-                        debug!("Packet has frame_start=true, frame_infos.len()={}, frame_info_idx={}",
-                            frame_infos.len(), frame_info_idx);
-                        // Get frame info for this frame start
                         if frame_info_idx < frame_infos.len() {
                             let frame_info = &frame_infos[frame_info_idx];
                             frame_info_idx += 1;
-                            debug!("[FRAME_INFO] Using frame_info: minutes={}, seconds={}, frames={}, sector_count={}",
-                                     frame_info.minutes, frame_info.seconds, frame_info.frames, frame_info.sector_count);
 
-                            debug!("[FRAME_START_CHECK] frame_started={}, dst_sector_count={}, frame_buffer.len()={}",
-                                     self.frame_started, self.dst_sector_count, self.frame_buffer.len());
-
-                            // If we have a previous frame that's complete, decode it first
-                            if self.frame_started && self.dst_sector_count == 0 && !self.frame_buffer.is_empty() {
-                                // Check if previous frame passes timecode filter
-                                let should_decode = if let Some((start_fc, end_fc)) = self.timecode_filter {
-                                    if let Some(prev_timecode) = self.current_frame_timecode {
-                                        let passes = prev_timecode >= start_fc && prev_timecode < end_fc;
-                                        log::debug!(
-                                            "Timecode filter check: frame {} in range [{}, {})? {}",
-                                            prev_timecode, start_fc, end_fc, passes
-                                        );
-                                        passes
-                                    } else {
-                                        true // No timecode available, include frame
-                                    }
-                                } else {
-                                    true // No filter set, include all frames
+                            // If we have a previous frame that's complete, yield it.
+                            if self.frame_started
+                                && self.dst_sector_count == 0
+                                && !self.frame_buffer.is_empty()
+                            {
+                                let should_yield = match self.timecode_filter {
+                                    Some((s, e)) => self
+                                        .current_frame_timecode
+                                        .map(|tc| tc >= s && tc < e)
+                                        .unwrap_or(true),
+                                    None => true,
                                 };
 
-                                if should_decode {
-                                    if let Some(decoder) = &mut self.dst_decoder {
-                                        log::info!(
-                                            "Decoding complete DST frame at frame_start: {} bytes (timecode={})",
-                                            self.frame_buffer.len(),
-                                            self.current_frame_timecode.unwrap_or(0)
-                                        );
+                                if should_yield {
+                                    let yielded_tc = self.current_frame_timecode;
+                                    let raw = std::mem::take(&mut self.frame_buffer);
 
-                                        // Debug: Log first bytes of frame being sent to decoder
-                                        static DECODE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-                                        let count = DECODE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        if count < 5 {
-                                            let show_len = self.frame_buffer.len().min(16);
-                                            debug!("[DECODE_FRAME #{}] Passing to decoder: len={}, first_16_bytes={:02x?}",
-                                                     count, self.frame_buffer.len(), &self.frame_buffer[..show_len]);
-                                        }
+                                    // The packet that triggered this yield is the
+                                    // *first* packet of the next frame. Pre-account for
+                                    // it by decrementing the new sector_count, since
+                                    // the post-packet decrement at the bottom of the
+                                    // loop is skipped due to the early return.
+                                    self.frame_buffer.extend_from_slice(packet_data);
+                                    self.dst_sector_count =
+                                        (frame_info.sector_count as i32 - 1).max(0);
+                                    self.frame_started = true;
+                                    self.current_frame_timecode =
+                                        Some(frame_info.to_frame_count());
 
-                                        let mut dsd_buffer = vec![0u8; decoder.dsd_frame_bytes()];
-                                        let bytes_decoded = decoder.decode_frame(&self.frame_buffer, &mut dsd_buffer)?;
-                                        dsd_buffer.truncate(bytes_decoded);
-
-                                        // Clear and start new frame. The packet that triggered this
-                                        // decode is also the *first* packet of the next frame, so
-                                        // pre-account for it by decrementing the new sector_count.
-                                        // The post-packet decrement at the bottom of the loop is
-                                        // skipped due to this early `return`.
-                                        self.frame_buffer.clear();
-                                        self.frame_buffer.extend_from_slice(packet_data);
-                                        self.dst_sector_count = (frame_info.sector_count as i32 - 1).max(0);
-                                        self.frame_started = true;
-                                        self.current_frame_timecode = Some(frame_info.to_frame_count());
-
-                                        self.total_bytes += bytes_decoded as u64;
-                                        self.decoded_frames += 1;
-                                        return Ok(Some(dsd_buffer));
-                                    } else {
-                                        anyhow::bail!("DST decoder not initialized");
-                                    }
+                                    self.total_bytes += raw.len() as u64;
+                                    self.decoded_frames += 1;
+                                    self.last_yielded_timecode = yielded_tc;
+                                    return Ok(Some(raw));
                                 } else {
-                                    log::info!(
-                                        "Skipping frame outside timecode range: timecode={}",
-                                        self.current_frame_timecode.unwrap_or(0)
-                                    );
                                     self.filtered_frames += 1;
                                 }
                             }
 
-                            // Unconditionally start new frame (matches C code behavior)
-                            log::info!("Frame start: resetting frame, new sector_count={}, timecode={:02}:{:02}:{:02}",
-                                frame_info.sector_count, frame_info.minutes, frame_info.seconds, frame_info.frames);
+                            // Start new frame (whether or not previous was yielded).
                             self.frame_buffer.clear();
                             self.frame_buffer.extend_from_slice(packet_data);
-
-                            // Debug: log first few frame starts
-                            static FRAME_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-                            let count = FRAME_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if count < 5 {
-                                let show_bytes = packet_data.len().min(16);
-                                debug!("[FRAME_START #{} FIRST_PKT] len={}, offset_in_sector={}, first_16_bytes={:02x?}",
-                                         count, packet_data.len(), offset, &packet_data[..show_bytes]);
-                            }
-
                             self.dst_sector_count = frame_info.sector_count as i32;
                             self.frame_started = true;
                             self.current_frame_timecode = Some(frame_info.to_frame_count());
@@ -431,61 +390,29 @@ impl AudioSectorParser {
             }
         } else {
             // DST format - check if frame is complete (sector_count reached 0)
-            if self.frame_started && self.dst_sector_count == 0 && !self.frame_buffer.is_empty() {
-                // Check if frame passes timecode filter
-                let should_decode = if let Some((start_fc, end_fc)) = self.timecode_filter {
-                    if let Some(timecode) = self.current_frame_timecode {
-                        let passes = timecode >= start_fc && timecode < end_fc;
-                        log::debug!(
-                            "Timecode filter check (end of sector): frame {} in range [{}, {})? {}",
-                            timecode, start_fc, end_fc, passes
-                        );
-                        passes
-                    } else {
-                        true // No timecode available, include frame
-                    }
-                } else {
-                    true // No filter set, include all frames
+            if self.frame_started
+                && self.dst_sector_count == 0
+                && !self.frame_buffer.is_empty()
+            {
+                let should_yield = match self.timecode_filter {
+                    Some((s, e)) => self
+                        .current_frame_timecode
+                        .map(|tc| tc >= s && tc < e)
+                        .unwrap_or(true),
+                    None => true,
                 };
 
-                if should_decode {
-                    if let Some(decoder) = &mut self.dst_decoder {
-                        log::info!(
-                            "Decoding complete DST frame (end of sector): {} bytes, timecode={}, first 16: {:02x?}",
-                            self.frame_buffer.len(),
-                            self.current_frame_timecode.unwrap_or(0),
-                            &self.frame_buffer[..16.min(self.frame_buffer.len())]
-                        );
-
-                        // Debug: Log first bytes of frame being sent to decoder
-                        static DECODE_COUNT_2: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-                        let count2 = DECODE_COUNT_2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if count2 < 5 {
-                            let show_len = self.frame_buffer.len().min(16);
-                            debug!("[DECODE_FRAME_PATH2 #{}] Passing to decoder: len={}, first_16_bytes={:02x?}",
-                                     count2, self.frame_buffer.len(), &self.frame_buffer[..show_len]);
-                        }
-
-                        let mut dsd_buffer = vec![0u8; decoder.dsd_frame_bytes()];
-                        let bytes_decoded = decoder.decode_frame(&self.frame_buffer, &mut dsd_buffer)?;
-                        dsd_buffer.truncate(bytes_decoded);
-
-                        // Clear frame state
-                        self.frame_buffer.clear();
-                        self.frame_started = false;
-                        self.dst_sector_count = 0;
-
-                        self.total_bytes += bytes_decoded as u64;
-                        self.decoded_frames += 1;
-                        return Ok(Some(dsd_buffer));
-                    }
+                if should_yield {
+                    let yielded_tc = self.current_frame_timecode;
+                    let raw = std::mem::take(&mut self.frame_buffer);
+                    self.frame_started = false;
+                    self.dst_sector_count = 0;
+                    self.total_bytes += raw.len() as u64;
+                    self.decoded_frames += 1;
+                    self.last_yielded_timecode = yielded_tc;
+                    return Ok(Some(raw));
                 } else {
-                    log::info!(
-                        "Skipping frame outside timecode range (end of sector): timecode={}",
-                        self.current_frame_timecode.unwrap_or(0)
-                    );
                     self.filtered_frames += 1;
-                    // Clear frame state but don't return data
                     self.frame_buffer.clear();
                     self.frame_started = false;
                     self.dst_sector_count = 0;
@@ -495,71 +422,30 @@ impl AudioSectorParser {
         }
     }
 
-    /// Flush any remaining buffered data
-    ///
-    /// Call this at the end of extraction to get any remaining partial frame data.
+    /// Yield the final partial frame buffered at end-of-stream, if any. For
+    /// DST this returns the *raw* DST frame bytes; the caller still needs to
+    /// run them through the decoder.
     pub fn flush(&mut self) -> Option<Vec<u8>> {
         if self.frame_buffer.is_empty() {
             None
         } else if matches!(self.frame_format, FrameFormat::Dst) {
-            // Check if frame passes timecode filter
-            let should_decode = if let Some((start_fc, end_fc)) = self.timecode_filter {
-                if let Some(timecode) = self.current_frame_timecode {
-                    let passes = timecode >= start_fc && timecode < end_fc;
-                    log::debug!(
-                        "Timecode filter check (flush): frame {} in range [{}, {})? {}",
-                        timecode, start_fc, end_fc, passes
-                    );
-                    passes
-                } else {
-                    true // No timecode available, include frame
-                }
-            } else {
-                true // No filter set, include all frames
+            let should_yield = match self.timecode_filter {
+                Some((s, e)) => self
+                    .current_frame_timecode
+                    .map(|tc| tc >= s && tc < e)
+                    .unwrap_or(true),
+                None => true,
             };
-
-            if !should_decode {
-                log::info!(
-                    "Skipping final frame outside timecode range: timecode={}",
-                    self.current_frame_timecode.unwrap_or(0)
-                );
+            if !should_yield {
+                self.frame_buffer.clear();
                 return None;
             }
-
-            // Decode the final DST frame if we have one
-            if let Some(decoder) = &mut self.dst_decoder {
-                log::debug!(
-                    "Flushing final DST frame: {} bytes, timecode={}",
-                    self.frame_buffer.len(),
-                    self.current_frame_timecode.unwrap_or(0)
-                );
-
-                // Debug: Log first bytes of frame being sent to decoder
-                static DECODE_COUNT_3: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-                let count3 = DECODE_COUNT_3.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if count3 < 5 {
-                    let show_len = self.frame_buffer.len().min(16);
-                    debug!("[DECODE_FRAME_FLUSH #{}] Passing to decoder: len={}, first_16_bytes={:02x?}",
-                             count3, self.frame_buffer.len(), &self.frame_buffer[..show_len]);
-                }
-
-                let mut dsd_buffer = vec![0u8; decoder.dsd_frame_bytes()];
-                match decoder.decode_frame(&self.frame_buffer, &mut dsd_buffer) {
-                    Ok(bytes_decoded) => {
-                        dsd_buffer.truncate(bytes_decoded);
-                        self.frame_buffer.clear();
-                        self.total_bytes += bytes_decoded as u64;
-                        Some(dsd_buffer)
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to decode final DST frame: {}", e);
-                        None
-                    }
-                }
-            } else {
-                log::warn!("No DST decoder available for flush");
-                None
-            }
+            let yielded_tc = self.current_frame_timecode;
+            let raw = std::mem::take(&mut self.frame_buffer);
+            self.total_bytes += raw.len() as u64;
+            self.decoded_frames += 1;
+            self.last_yielded_timecode = yielded_tc;
+            Some(raw)
         } else {
             // Uncompressed DSD - return as-is
             let frame_data = std::mem::take(&mut self.frame_buffer);

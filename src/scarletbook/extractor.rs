@@ -1,3 +1,4 @@
+use crate::dst_decoder::decoder::DstDecoder;
 use crate::sacd_reader::SacdReader;
 use crate::scarletbook::area_toc::AreaToc;
 use crate::scarletbook::audio::AudioSectorParser;
@@ -7,6 +8,8 @@ use crate::scarletbook::master_toc::{MasterText, MasterToc};
 use crate::scarletbook::types::FrameFormat;
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
+use rayon::prelude::*;
+use std::cell::RefCell;
 use std::path::Path;
 use log::debug;
 
@@ -21,7 +24,9 @@ impl<R: SacdReader> TrackExtractor<R> {
         Self { reader }
     }
 
-    /// Extract a single track to a DSF file
+    /// Extract a single track to a DSF file. The reader must be `Send`
+    /// because the producer phase of the streaming pipeline runs on a
+    /// separate thread (sectors are read in parallel with decode/write).
     pub fn extract_track(
         &mut self,
         master_toc: &MasterToc,
@@ -30,7 +35,10 @@ impl<R: SacdReader> TrackExtractor<R> {
         track_number: usize,
         output_path: &Path,
         progress_bar: Option<&ProgressBar>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        R: Send,
+    {
         // Validate track number
         if track_number < 1 || track_number > area_toc.track_count as usize {
             anyhow::bail!(
@@ -162,53 +170,150 @@ impl<R: SacdReader> TrackExtractor<R> {
             (end_fc % 75) as u8,
         );
 
-        // Read and process sectors in batches to amortise per-call overhead
-        // (per-sector seek+read syscalls dominated wall-time before this).
+        // Streaming producer-consumer pipeline. A producer thread reads
+        // sectors and parses them into raw frame bytes, sending each frame
+        // through a bounded mpsc channel. The main thread receives frames in
+        // batches, decodes each batch in parallel (rayon, thread-local
+        // DstDecoders), and writes the decoded frames to the DSF in order.
+        //
+        // The bounded channel is what enables I/O–compute overlap for slow
+        // sources (e.g. NetReader): the producer keeps fetching sectors
+        // while the consumer is busy decoding/writing. For a fast local ISO
+        // the producer simply backpressures on a full channel; total work
+        // is the same as a sequential decode.
+        //
+        // Memory cap: CHANNEL_CAPACITY raw DST frames in flight + one
+        // BATCH_SIZE-sized batch being decoded ≈ <10 MB for DSD64.
         const BATCH_SECTORS: u32 = 256;
         const SECTOR: usize = 2048;
-        let mut current_lsn = start_lsn;
-        let mut sectors_processed = 0u32;
+        const BATCH_SIZE: usize = 256;
+        // ~16k raw DST frames in flight ≈ ~50 MB at typical 3 KB/frame.
+        // Generous enough to absorb multi-second network stalls; for a
+        // local ISO the producer just backpressures on a full channel
+        // before this fills up.
+        const CHANNEL_CAPACITY: usize = 16384;
 
-        while current_lsn < end_lsn {
-            let want = (end_lsn - current_lsn).min(BATCH_SECTORS);
-            let chunk = self
-                .reader
-                .read_data(current_lsn, want)
-                .with_context(|| format!("Failed to read {} sectors at LSN {}", want, current_lsn))?;
-            if chunk.len() < (want as usize) * SECTOR {
-                anyhow::bail!(
-                    "Short read at LSN {}: got {} bytes, expected {}",
-                    current_lsn,
-                    chunk.len(),
-                    (want as usize) * SECTOR
-                );
-            }
-            for i in 0..want {
-                let off = (i as usize) * SECTOR;
-                let sector = &chunk[off..off + SECTOR];
-                if let Some(frame_data) = audio_parser.parse_sector(sector)? {
-                    dsf_writer.write_samples(&frame_data)?;
+        let is_dst = matches!(area_toc.frame_format, FrameFormat::Dst);
+        let channels = area_toc.channel_count as usize;
+        let sample_rate = DSD64_SAMPLE_RATE as usize;
+        let track_num = track_number;
+        let pb_owned = progress_bar.cloned();
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(CHANNEL_CAPACITY);
+        let reader: &mut R = &mut self.reader;
+
+        std::thread::scope(|s| -> Result<()> {
+            // ---- Producer ----
+            let producer = s.spawn(move || -> Result<(u64, u64)> {
+                let mut current_lsn = start_lsn;
+                let mut sectors_processed = 0u32;
+                'outer: while current_lsn < end_lsn {
+                    let want = (end_lsn - current_lsn).min(BATCH_SECTORS);
+                    let chunk = reader
+                        .read_data(current_lsn, want)
+                        .with_context(|| format!("read {} sectors @ LSN {}", want, current_lsn))?;
+                    if chunk.len() < (want as usize) * SECTOR {
+                        anyhow::bail!(
+                            "Short read at LSN {}: got {} bytes, expected {}",
+                            current_lsn,
+                            chunk.len(),
+                            (want as usize) * SECTOR
+                        );
+                    }
+                    for i in 0..want {
+                        let off = (i as usize) * SECTOR;
+                        let sector = &chunk[off..off + SECTOR];
+                        if let Some(raw) = audio_parser.parse_sector(sector)? {
+                            if tx.send(raw).is_err() {
+                                // Consumer dropped (almost certainly due to
+                                // a write/decode error). Stop producing —
+                                // the consumer's error will be propagated.
+                                break 'outer;
+                            }
+                        }
+                    }
+                    current_lsn += want;
+                    sectors_processed += want;
+                    if let Some(pb) = pb_owned.as_ref() {
+                        pb.set_position(sectors_processed as u64);
+                    }
                 }
-            }
-            current_lsn += want;
-            sectors_processed += want;
-            if let Some(pb) = progress_bar {
-                pb.set_position(sectors_processed as u64);
-            }
-        }
+                if let Some(raw) = audio_parser.flush() {
+                    let _ = tx.send(raw);
+                }
+                Ok((audio_parser.decoded_frames, audio_parser.filtered_frames))
+                // tx dropped here -> consumer's recv() returns Err, ending its loop.
+            });
 
-        // Flush any remaining data
-        if let Some(frame_data) = audio_parser.flush() {
-            dsf_writer.write_samples(&frame_data)?;
-        }
+            // ---- Consumer (this thread) ----
+            // Run the consumer in an inner scope so `rx` is dropped when it
+            // returns (including via `?`). Dropping `rx` unblocks any
+            // producer waiting on a full channel after a consumer error.
+            let consumer_res = (|rx: std::sync::mpsc::Receiver<Vec<u8>>| -> Result<()> {
+                thread_local! {
+                    static TLS_DECODER: RefCell<Option<DstDecoder>> = const {
+                        RefCell::new(None)
+                    };
+                }
+                let mut batch: Vec<Vec<u8>> = Vec::with_capacity(BATCH_SIZE);
+                let process =
+                    |batch: &mut Vec<Vec<u8>>, dsf_writer: &mut DsfWriter| -> Result<()> {
+                        if batch.is_empty() {
+                            return Ok(());
+                        }
+                        if is_dst {
+                            // Parallel decode of this batch.
+                            let decoded: Result<Vec<Vec<u8>>> = batch
+                                .par_iter()
+                                .map(|raw| -> Result<Vec<u8>> {
+                                    TLS_DECODER.with(|cell| -> Result<Vec<u8>> {
+                                        let mut slot = cell.borrow_mut();
+                                        if slot.is_none() {
+                                            *slot = Some(DstDecoder::new(channels, sample_rate)?);
+                                        }
+                                        let dec = slot.as_mut().unwrap();
+                                        let mut buf = vec![0u8; dec.dsd_frame_bytes()];
+                                        let n = dec.decode_frame(raw, &mut buf)?;
+                                        buf.truncate(n);
+                                        Ok(buf)
+                                    })
+                                })
+                                .collect();
+                            for f in decoded? {
+                                dsf_writer.write_samples(&f)?;
+                            }
+                        } else {
+                            for raw in batch.iter() {
+                                dsf_writer.write_samples(raw)?;
+                            }
+                        }
+                        batch.clear();
+                        Ok(())
+                    };
 
-        log::info!(
-            "Track {}: decoded {} frames ({} filtered), {} sectors walked",
-            track_number,
-            audio_parser.decoded_frames,
-            audio_parser.filtered_frames,
-            sectors_processed,
-        );
+                for raw in rx.iter() {
+                    batch.push(raw);
+                    if batch.len() >= BATCH_SIZE {
+                        process(&mut batch, &mut dsf_writer)?;
+                    }
+                }
+                process(&mut batch, &mut dsf_writer)?;
+                Ok(())
+            })(rx);
+
+            let producer_res = producer
+                .join()
+                .map_err(|_| anyhow::anyhow!("producer thread panicked"))?;
+
+            // Surface whichever side failed first.
+            consumer_res?;
+            let (decoded_n, filtered_n) = producer_res?;
+            log::info!(
+                "Track {}: yielded {} frames ({} filtered)",
+                track_num, decoded_n, filtered_n,
+            );
+            Ok(())
+        })?;
 
         // Finalize DSF file
         dsf_writer.finalize()?;
@@ -235,7 +340,10 @@ impl<R: SacdReader> TrackExtractor<R> {
         track_numbers: &[usize],
         output_dir: &Path,
         prefix: &str,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        R: Send,
+    {
         // Determine which tracks to extract
         let tracks_to_extract: Vec<usize> = if track_numbers.is_empty() {
             // Extract all tracks
