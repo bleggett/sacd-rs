@@ -1,0 +1,8 @@
+*.rs !text !filter !merge !diff
+*.toml !text !filter !merge !diff
+*.lock !text !filter !merge !diff
+*.proto !text !filter !merge !diff
+*.md !text !filter !merge !diff
+*.txt !text !filter !merge !diff
+*.dsd !text !filter !merge !diff
+LICENSE !text !filter !merge !diff
