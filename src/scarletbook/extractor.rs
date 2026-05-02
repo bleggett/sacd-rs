@@ -1,4 +1,4 @@
-use crate::dst_decoder::decoder::DstDecoder;
+use dst_decoder::decoder::DstDecoder;
 use crate::sacd_reader::SacdReader;
 use crate::scarletbook::area_toc::AreaToc;
 use crate::scarletbook::audio::AudioSectorParser;
