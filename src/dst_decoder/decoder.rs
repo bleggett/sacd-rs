@@ -232,14 +232,16 @@ impl AcData {
             self.a = h;
             1u8
         };
-        // Renormalize. `cb` is zero-padded past `fs` by the caller, so the
-        // bounds check the C reference does (`if cbptr < fs`) is unnecessary
-        // — past-end reads return 0, matching the spec's "insert zero in LSB
-        // of C" rule.
-        let _ = fs;
+        // Renormalize. The spec's rule is "insert 0 into LSB of C past end
+        // of arithmetic data". `cbptr` may advance past `fs` for short
+        // a_data segments where the renormalise loop iterates more times
+        // than there are bits left, so the in-bounds read is conditional.
         while self.a < HALF {
             self.a <<= 1;
-            self.c = (self.c << 1) | cb[self.cbptr as usize] as u32;
+            self.c <<= 1;
+            if self.cbptr < fs {
+                self.c |= cb[self.cbptr as usize] as u32;
+            }
             self.cbptr += 1;
         }
         b
@@ -971,11 +973,7 @@ impl DstDecoder {
     fn read_arithmetic_coded_data(&mut self, reader: &mut BitReader) -> Result<()> {
         let n = self.a_data_len.max(0) as usize;
         self.a_data.clear();
-        // Reserve room for the AC bits + a small zero-padded tail so
-        // `decode_bit` can read past the end without a bounds check. The
-        // renormalise loop reads at most ABITS bits beyond cbptr, plus the
-        // flush walk; 64 zero bytes are plenty.
-        self.a_data.resize(n + 64, 0);
+        self.a_data.resize(n, 0);
         // Fast path: pull 8 bits at a time and expand them MSB-first to
         // a-data bytes. `read_byte` (= `read_uint(8)`) handles arbitrary
         // bit alignment — it spans byte boundaries when needed — so this
@@ -1391,6 +1389,35 @@ mod tests {
         let data = [0b1111_0010u8, 0b1000_0000];
         let mut r = BitReader::new(&data);
         assert_eq!(r.read_int(9).unwrap(), -27);
+    }
+
+    #[test]
+    fn ac_decode_bit_handles_cbptr_past_fs() {
+        // The arithmetic decoder's renormalise loop advances `cbptr` once
+        // per shift to the LSB of `c`. For a frame whose `a_data_len` is
+        // small (< the renormalise depth across one or more decode_bit
+        // calls), `cbptr` runs past `fs`. The spec's "insert 0 in LSB of
+        // C past end of arithmetic data" rule must be honoured without
+        // indexing past the end of `cb` — which would panic on a real
+        // SACD whose first frame happened to have a tiny a_data segment.
+        //
+        // Repro: set up an AcData with `fs = 16` (arbitrary tiny value),
+        // a zeroed `cb`, and drive enough `decode_bit` calls that the
+        // renormalise loop has to advance `cbptr` past `fs` many times.
+        let cb = vec![0u8; 16];
+        let fs: i32 = 16;
+        let mut ac = AcData::default();
+        ac.init(&cb, fs);
+        // After init, cbptr == ABITS + 1 = 13. Each decode_bit can
+        // shift several times, so a few hundred calls are plenty to
+        // run cbptr well past fs without bounds-checking the read.
+        for _ in 0..1000 {
+            let _ = ac.decode_bit(AC_PROBS / 2, &cb, fs);
+        }
+        assert!(
+            ac.cbptr > fs,
+            "test would not have exercised the past-fs path"
+        );
     }
 
     // BEGIN public-API tests
