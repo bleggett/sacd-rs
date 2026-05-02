@@ -288,9 +288,9 @@ impl<R: SacdReader> TrackExtractor<R> {
                         let off = (i as usize) * SECTOR;
                         let sector = &chunk[off..off + SECTOR];
                         let t_parse = Instant::now();
-                        let frame = audio_parser.parse_sector(sector)?;
+                        let frames = audio_parser.parse_sector(sector)?;
                         t_parse_ns += t_parse.elapsed().as_nanos() as u64;
-                        if let Some(raw) = frame {
+                        for raw in frames {
                             send_calls += 1;
                             let t_send = Instant::now();
                             let send_res = tx_raw.send(raw);

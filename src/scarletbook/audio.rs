@@ -219,13 +219,17 @@ impl AudioSectorParser {
         );
     }
 
-    /// Parse an audio sector and extract DSD samples
-    ///
-    /// Returns the extracted audio data if a complete frame is ready, otherwise None.
+    /// Parse an audio sector and extract any complete DST frames it
+    /// yields. A sector can contain multiple frame-start packets — when
+    /// frames are tiny (e.g., DSD-silence frames that fit in a single
+    /// 11-byte packet), one sector can complete N>1 frames. The C
+    /// reference handles this via a callback fired on each completion;
+    /// we collect into a `Vec` and return them all at once.
     ///
     /// # Arguments
     /// * `sector_data` - Raw sector data (2048 bytes)
-    pub fn parse_sector(&mut self, sector_data: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub fn parse_sector(&mut self, sector_data: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let mut yielded: Vec<Vec<u8>> = Vec::new();
         if sector_data.len() < 2048 {
             anyhow::bail!(
                 "Audio sector too short: {} bytes (expected 2048)",
@@ -417,28 +421,20 @@ impl AudioSectorParser {
                                 if should_yield {
                                     let yielded_tc = self.current_frame_timecode;
                                     let raw = std::mem::take(&mut self.frame_buffer);
-
-                                    // The packet that triggered this yield is the
-                                    // *first* packet of the next frame. Pre-account for
-                                    // it by decrementing the new sector_count, since
-                                    // the post-packet decrement at the bottom of the
-                                    // loop is skipped due to the early return.
-                                    self.frame_buffer.extend_from_slice(packet_data);
-                                    self.dst_sector_count =
-                                        (frame_info.sector_count as i32 - 1).max(0);
-                                    self.frame_started = true;
-                                    self.current_frame_timecode = Some(frame_info.to_frame_count());
-
                                     self.total_bytes += raw.len() as u64;
                                     self.decoded_frames += 1;
                                     self.last_yielded_timecode = yielded_tc;
-                                    return Ok(Some(raw));
+                                    yielded.push(raw);
                                 } else {
                                     self.filtered_frames += 1;
                                 }
                             }
 
                             // Start new frame (whether or not previous was yielded).
+                            // The bottom-of-loop sector_count decrement runs after
+                            // this block, so the new frame's count starts at the
+                            // full `frame_info.sector_count` and is decremented to
+                            // account for *this* packet.
                             self.frame_buffer.clear();
                             self.frame_buffer.extend_from_slice(packet_data);
                             self.dst_sector_count = frame_info.sector_count as i32;
@@ -488,41 +484,38 @@ impl AudioSectorParser {
         if !matches!(self.frame_format, FrameFormat::Dst) {
             const CHUNK_SIZE: usize = 32768;
             if self.frame_buffer.len() >= CHUNK_SIZE {
-                // Return accumulated data as a chunk
                 let chunk_data = std::mem::take(&mut self.frame_buffer);
-                Ok(Some(chunk_data))
-            } else {
-                Ok(None)
+                yielded.push(chunk_data);
             }
-        } else {
-            // DST format - check if frame is complete (sector_count reached 0)
-            if self.frame_started && self.dst_sector_count == 0 && !self.frame_buffer.is_empty() {
-                let should_yield = match self.timecode_filter {
-                    Some((s, e)) => self
-                        .current_frame_timecode
-                        .map(|tc| tc >= s && tc < e)
-                        .unwrap_or(true),
-                    None => true,
-                };
+        } else if self.frame_started
+            && self.dst_sector_count == 0
+            && !self.frame_buffer.is_empty()
+        {
+            let should_yield = match self.timecode_filter {
+                Some((s, e)) => self
+                    .current_frame_timecode
+                    .map(|tc| tc >= s && tc < e)
+                    .unwrap_or(true),
+                None => true,
+            };
 
-                if should_yield {
-                    let yielded_tc = self.current_frame_timecode;
-                    let raw = std::mem::take(&mut self.frame_buffer);
-                    self.frame_started = false;
-                    self.dst_sector_count = 0;
-                    self.total_bytes += raw.len() as u64;
-                    self.decoded_frames += 1;
-                    self.last_yielded_timecode = yielded_tc;
-                    return Ok(Some(raw));
-                } else {
-                    self.filtered_frames += 1;
-                    self.frame_buffer.clear();
-                    self.frame_started = false;
-                    self.dst_sector_count = 0;
-                }
+            if should_yield {
+                let yielded_tc = self.current_frame_timecode;
+                let raw = std::mem::take(&mut self.frame_buffer);
+                self.frame_started = false;
+                self.dst_sector_count = 0;
+                self.total_bytes += raw.len() as u64;
+                self.decoded_frames += 1;
+                self.last_yielded_timecode = yielded_tc;
+                yielded.push(raw);
+            } else {
+                self.filtered_frames += 1;
+                self.frame_buffer.clear();
+                self.frame_started = false;
+                self.dst_sector_count = 0;
             }
-            Ok(None)
         }
+        Ok(yielded)
     }
 
     /// Yield the final partial frame buffered at end-of-stream, if any. For
@@ -672,9 +665,7 @@ mod tests {
 
         let mut produced = 0usize;
         for sector in &sectors {
-            if parser.parse_sector(sector).expect("parse_sector").is_some() {
-                produced += 1;
-            }
+            produced += parser.parse_sector(sector).expect("parse_sector").len();
         }
         if parser.flush().is_some() {
             produced += 1;
@@ -690,5 +681,56 @@ mod tests {
             parser.decoded_frames, parser.filtered_frames
         );
         assert_eq!(produced, 3);
+    }
+
+    /// Regression test: a single sector containing multiple back-to-back
+    /// frame_start packets must yield ALL of them. The Dylan
+    /// `Slow Train Coming` ISO opens with stretches of 11-byte DSD-silence
+    /// frames packed many-per-sector; an earlier `parse_sector` returning
+    /// `Option<Vec<u8>>` would early-return after the first complete
+    /// frame, silently dropping every subsequent packet in the same
+    /// sector.
+    #[test]
+    fn parse_sector_yields_multiple_frames_in_one_sector() {
+        // Three tiny frames packed into a single sector. Each frame
+        // is 11 bytes (matches the Dylan silence-frame size) and
+        // declares `sector_count = 1`, meaning the entire frame fits
+        // in one packet within this sector.
+        let frame_bytes: [u8; 11] = [0xff, 0x06, 0x00, 0x80, 0x38, 0x10, 0x10, 0x60, 0x01, 0x49, 0x80];
+
+        let mut s = Vec::with_capacity(SECTOR_SIZE);
+        s.push(sector_header(3, 3));
+        // Three packet info entries.
+        s.extend_from_slice(&pkt_info(true, 2, frame_bytes.len() as u16));
+        s.extend_from_slice(&pkt_info(true, 2, frame_bytes.len() as u16));
+        s.extend_from_slice(&pkt_info(true, 2, frame_bytes.len() as u16));
+        // Three frame_info entries, each at sequential timecodes.
+        s.extend_from_slice(&frm_info(0, 0, 0, 1));
+        s.extend_from_slice(&frm_info(0, 0, 1, 1));
+        s.extend_from_slice(&frm_info(0, 0, 2, 1));
+        // Three packets of frame data.
+        s.extend_from_slice(&frame_bytes);
+        s.extend_from_slice(&frame_bytes);
+        s.extend_from_slice(&frame_bytes);
+        s.resize(SECTOR_SIZE, 0);
+
+        let mut parser = AudioSectorParser::new(FrameFormat::Dst).expect("parser create");
+        parser.set_timecode_filter(0, 0, 0, 0, 0, 100);
+
+        let yielded_in_sector = parser.parse_sector(&s).expect("parse_sector");
+        let trailing = parser.flush();
+
+        // The first sector should drain frames 0 and 1 directly. Frame 2
+        // is still buffered after the sector boundary (sector_count=0
+        // but no following frame_start has triggered a yield yet) and
+        // gets emitted by `flush`.
+        let total_yielded = yielded_in_sector.len() + trailing.is_some() as usize;
+        assert_eq!(
+            total_yielded, 3,
+            "expected 3 frames from one sector; got {} (parse_sector returned {} frames, flush={})",
+            total_yielded,
+            yielded_in_sector.len(),
+            trailing.is_some()
+        );
     }
 }
