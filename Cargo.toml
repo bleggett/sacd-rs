@@ -6,7 +6,7 @@ description = "SACD ripper client. Designed to be used with a jailbroken SACD pl
 license = "Apache-2.0"
 repository = "https://github.com/bleggett/sacd-rs"
 exclude = [
-    "src/test_fixtures/*",
+    "tests/*",
 ]
 
 [dependencies]
