@@ -2,6 +2,12 @@
 name = "sacd-rs"
 version = "0.1.0"
 edition = "2024"
+description = "SACD ripper client. Designed to be used with a jailbroken SACD player, such as specific models of PS3s or some Sony Bluray players, which can support running a server to stream raw SACD image data over the network to a client."
+license = "Apache-2.0"
+repository = "https://github.com/bleggett/sacd-rs"
+exclude = [
+    "src/test_fixtures/*",
+]
 
 [dependencies]
 anyhow = "1.0.100"
